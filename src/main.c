@@ -1,0 +1,1134 @@
+#define _POSIX_C_SOURCE 200809L
+
+#if defined(__has_include)
+#if __has_include(<postgresql/libpq-fe.h>)
+#include <postgresql/libpq-fe.h>
+#else
+#include <libpq-fe.h>
+#endif
+#else
+#include <libpq-fe.h>
+#endif
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+static const char *kLanguage = "C";
+static const char *kApiVersion = "0.2.0";
+static const char *kFramework = "POSIX sockets";
+static const int kCreatedYear = 2026;
+static const int kSchemaVersion = 1;
+#ifdef __VERSION__
+static const char *kLanguageVersion = __VERSION__;
+#else
+static const char *kLanguageVersion = "C11";
+#endif
+
+static const char *kSpeakerCols =
+    "slug, first_name, last_name, name, tagline, bio, company, location, "
+    "photo_path, twitter_url, linkedin_url, website_url, github_url, featured";
+static const char *kYearSponsorCols =
+    "slug, name, website, logo_path, description, blurb, tier, featured, year, "
+    "twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url";
+static const char *kSponsorCols =
+    "slug, name, website, logo_path, description, twitter_url, linkedin_url, "
+    "youtube_url, instagram_url, facebook_url";
+static const char *kTalkSelect =
+    "slug, title, description, format, youtube_id, year, speaker_slug, "
+    "COALESCE(array_to_json(languages), '[]'::json)::text AS languages, "
+    "COALESCE(array_to_json(topics), '[]'::json)::text AS topics";
+
+static const char *kEndpointsJson =
+    "["
+    "{\"method\":\"GET\",\"path\":\"/\",\"query\":[]},"
+    "{\"method\":\"GET\",\"path\":\"/health\",\"query\":[]},"
+    "{\"method\":\"GET\",\"path\":\"/v1/years\",\"query\":[]},"
+    "{\"method\":\"GET\",\"path\":\"/v1/speakers\",\"query\":[\"year\"]},"
+    "{\"method\":\"GET\",\"path\":\"/v1/speakers/:slug\",\"query\":[]},"
+    "{\"method\":\"GET\",\"path\":\"/v1/speakers/:year/:slug\",\"query\":[]},"
+    "{\"method\":\"GET\",\"path\":\"/v1/sponsors\",\"query\":[\"year\"]},"
+    "{\"method\":\"GET\",\"path\":\"/v1/sponsors/:slug\",\"query\":[]},"
+    "{\"method\":\"GET\",\"path\":\"/v1/sponsors/:year/:slug\",\"query\":[]}"
+    "]";
+
+static char g_dsn[512];
+static char g_port[16];
+
+static const char *env_or(const char *key, const char *fallback) {
+  const char *v = getenv(key);
+  return (v && *v) ? v : fallback;
+}
+
+typedef struct {
+  char *s;
+  size_t n, cap;
+} Buf;
+
+static void buf_init(Buf *b) {
+  b->cap = 256;
+  b->n = 0;
+  b->s = malloc(b->cap);
+  if (b->s) b->s[0] = 0;
+}
+
+static void buf_grow(Buf *b, size_t need) {
+  size_t want = b->n + need + 1;
+  if (want <= b->cap) return;
+  size_t cap = b->cap ? b->cap : 256;
+  while (cap < want) cap *= 2;
+  char *ns = realloc(b->s, cap);
+  if (!ns) abort();
+  b->s = ns;
+  b->cap = cap;
+}
+
+static void buf_append(Buf *b, const char *p, size_t n) {
+  buf_grow(b, n);
+  memcpy(b->s + b->n, p, n);
+  b->n += n;
+  b->s[b->n] = 0;
+}
+
+static void buf_puts(Buf *b, const char *s) { buf_append(b, s, strlen(s)); }
+
+static void buf_printf(Buf *b, const char *fmt, ...) {
+  char tmp[512];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if ((size_t)n < sizeof(tmp)) {
+    buf_append(b, tmp, (size_t)n);
+    return;
+  }
+  buf_grow(b, (size_t)n);
+  if (!b->s) return;
+  va_start(ap, fmt);
+  vsnprintf(b->s + b->n, b->cap - b->n, fmt, ap);
+  va_end(ap);
+  b->n += (size_t)n;
+}
+
+static void buf_free(Buf *b) {
+  free(b->s);
+  b->s = NULL;
+  b->n = b->cap = 0;
+}
+
+static void json_string(Buf *b, const char *v) {
+  if (!v) {
+    buf_puts(b, "null");
+    return;
+  }
+  buf_puts(b, "\"");
+  for (const unsigned char *p = (const unsigned char *)v; *p; ++p) {
+    switch (*p) {
+      case '"': buf_puts(b, "\\\""); break;
+      case '\\': buf_puts(b, "\\\\"); break;
+      case '\n': buf_puts(b, "\\n"); break;
+      case '\r': buf_puts(b, "\\r"); break;
+      case '\t': buf_puts(b, "\\t"); break;
+      default:
+        if (*p < 0x20) buf_printf(b, "\\u%04x", *p);
+        else buf_append(b, (const char *)p, 1);
+    }
+  }
+  buf_puts(b, "\"");
+}
+
+typedef struct {
+  Buf *b;
+  int first;
+} Obj;
+
+static void obj_begin(Obj *o, Buf *b) {
+  o->b = b;
+  o->first = 1;
+  buf_puts(b, "{");
+}
+
+static void obj_sep(Obj *o) {
+  if (!o->first) buf_puts(o->b, ",");
+  o->first = 0;
+}
+
+static void obj_key(Obj *o, const char *k) {
+  obj_sep(o);
+  json_string(o->b, k);
+  buf_puts(o->b, ":");
+}
+
+static void obj_str(Obj *o, const char *k, const char *v) {
+  obj_key(o, k);
+  json_string(o->b, v);
+}
+
+static void obj_bool(Obj *o, const char *k, int v) {
+  obj_key(o, k);
+  buf_puts(o->b, v ? "true" : "false");
+}
+
+static void obj_int(Obj *o, const char *k, long v) {
+  obj_key(o, k);
+  buf_printf(o->b, "%ld", v);
+}
+
+static void obj_raw(Obj *o, const char *k, const char *json) {
+  obj_key(o, k);
+  buf_puts(o->b, json ? json : "null");
+}
+
+static void obj_end(Obj *o) { buf_puts(o->b, "}"); }
+
+static const char *pgcol(PGresult *r, int row, const char *name) {
+  int i = PQfnumber(r, name);
+  if (i < 0 || PQgetisnull(r, row, i)) return NULL;
+  return PQgetvalue(r, row, i);
+}
+
+static int truthy(const char *v) { return v && (v[0] == 't' || v[0] == 'T' || v[0] == '1'); }
+
+static int as_int(const char *v) { return v ? atoi(v) : 0; }
+
+static PGresult *exec_params(PGconn *c, const char *sql, int n, const char **vals) {
+  return PQexecParams(c, sql, n, NULL, vals, NULL, NULL, 0);
+}
+
+static int res_ok(PGresult *r) {
+  if (!r) return 0;
+  ExecStatusType s = PQresultStatus(r);
+  return s == PGRES_TUPLES_OK || s == PGRES_COMMAND_OK;
+}
+
+static void speaker_fields(Obj *o, PGresult *r, int row) {
+  obj_str(o, "slug", pgcol(r, row, "slug"));
+  obj_str(o, "first_name", pgcol(r, row, "first_name"));
+  obj_str(o, "last_name", pgcol(r, row, "last_name"));
+  obj_str(o, "name", pgcol(r, row, "name"));
+  obj_str(o, "tagline", pgcol(r, row, "tagline"));
+  obj_str(o, "bio", pgcol(r, row, "bio"));
+  obj_str(o, "company", pgcol(r, row, "company"));
+  obj_str(o, "location", pgcol(r, row, "location"));
+  obj_str(o, "photo_path", pgcol(r, row, "photo_path"));
+  obj_str(o, "twitter_url", pgcol(r, row, "twitter_url"));
+  obj_str(o, "linkedin_url", pgcol(r, row, "linkedin_url"));
+  obj_str(o, "website_url", pgcol(r, row, "website_url"));
+  obj_str(o, "github_url", pgcol(r, row, "github_url"));
+  obj_bool(o, "featured", truthy(pgcol(r, row, "featured")));
+}
+
+static void year_sponsor_fields(Obj *o, PGresult *r, int row) {
+  obj_str(o, "slug", pgcol(r, row, "slug"));
+  obj_str(o, "name", pgcol(r, row, "name"));
+  obj_str(o, "website", pgcol(r, row, "website"));
+  obj_str(o, "logo_path", pgcol(r, row, "logo_path"));
+  obj_str(o, "description", pgcol(r, row, "description"));
+  obj_str(o, "blurb", pgcol(r, row, "blurb"));
+  obj_str(o, "tier", pgcol(r, row, "tier"));
+  obj_bool(o, "featured", truthy(pgcol(r, row, "featured")));
+  obj_int(o, "year", as_int(pgcol(r, row, "year")));
+  obj_str(o, "twitter_url", pgcol(r, row, "twitter_url"));
+  obj_str(o, "linkedin_url", pgcol(r, row, "linkedin_url"));
+  obj_str(o, "youtube_url", pgcol(r, row, "youtube_url"));
+  obj_str(o, "instagram_url", pgcol(r, row, "instagram_url"));
+  obj_str(o, "facebook_url", pgcol(r, row, "facebook_url"));
+}
+
+static void sponsor_fields(Obj *o, PGresult *r, int row) {
+  obj_str(o, "slug", pgcol(r, row, "slug"));
+  obj_str(o, "name", pgcol(r, row, "name"));
+  obj_str(o, "website", pgcol(r, row, "website"));
+  obj_str(o, "logo_path", pgcol(r, row, "logo_path"));
+  obj_str(o, "description", pgcol(r, row, "description"));
+  obj_str(o, "twitter_url", pgcol(r, row, "twitter_url"));
+  obj_str(o, "linkedin_url", pgcol(r, row, "linkedin_url"));
+  obj_str(o, "youtube_url", pgcol(r, row, "youtube_url"));
+  obj_str(o, "instagram_url", pgcol(r, row, "instagram_url"));
+  obj_str(o, "facebook_url", pgcol(r, row, "facebook_url"));
+}
+
+static void json_str_array_from_pgjson(Buf *b, const char *raw) {
+  if (!raw || raw[0] != '[') {
+    buf_puts(b, "[]");
+    return;
+  }
+  buf_puts(b, raw);
+}
+
+static void collect_from_json_array(const char *raw, Buf *uniq_buf, int *count) {
+  if (!raw || raw[0] != '[') return;
+  const char *p = raw + 1;
+  while (*p) {
+    while (*p && (*p == ' ' || *p == ',' || *p == '\n')) p++;
+    if (*p == ']') break;
+    if (*p != '"') break;
+    p++;
+    char cur[256];
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < sizeof(cur)) {
+      if (*p == '\\' && p[1]) {
+        p++;
+        cur[n++] = *p++;
+      } else {
+        cur[n++] = *p++;
+      }
+    }
+    if (*p == '"') p++;
+    cur[n] = 0;
+    if (!n) continue;
+    /* skip if already present as JSON string in uniq_buf */
+    int found = 0;
+    if (uniq_buf->s) {
+      const char *q = uniq_buf->s;
+      while (*q) {
+        if (*q == '"') {
+          q++;
+          size_t m = 0;
+          while (q[m] && q[m] != '"') m++;
+          if (m == n && strncmp(q, cur, n) == 0) {
+            found = 1;
+            break;
+          }
+          q += m;
+          if (*q == '"') q++;
+        } else {
+          q++;
+        }
+      }
+    }
+    if (found) continue;
+    if (*count) buf_puts(uniq_buf, ",");
+    json_string(uniq_buf, cur);
+    (*count)++;
+  }
+}
+
+static void talks_json(PGconn *c, const char *slug, const char *year, Buf *out, Buf *langs, Buf *topics,
+                       int *ntalks) {
+  char sql[1024];
+  snprintf(sql, sizeof(sql), "SELECT %s FROM v1_talks WHERE speaker_slug = $1%s ORDER BY year DESC", kTalkSelect,
+           year ? " AND year = $2" : "");
+  const char *vals[2];
+  int nparams = 1;
+  vals[0] = slug;
+  if (year) {
+    vals[1] = year;
+    nparams = 2;
+  }
+  PGresult *r = exec_params(c, sql, nparams, vals);
+  buf_puts(out, "[");
+  *ntalks = 0;
+  int nlang = 0, ntop = 0;
+  if (res_ok(r)) {
+    for (int i = 0; i < PQntuples(r); i++) {
+      if (*ntalks) buf_puts(out, ",");
+      Obj o;
+      obj_begin(&o, out);
+      obj_str(&o, "slug", pgcol(r, i, "slug"));
+      obj_str(&o, "title", pgcol(r, i, "title"));
+      obj_str(&o, "description", pgcol(r, i, "description"));
+      obj_str(&o, "format", pgcol(r, i, "format"));
+      obj_str(&o, "youtube_id", pgcol(r, i, "youtube_id"));
+      obj_int(&o, "year", as_int(pgcol(r, i, "year")));
+      obj_str(&o, "speaker_slug", pgcol(r, i, "speaker_slug"));
+      obj_key(&o, "languages");
+      json_str_array_from_pgjson(out, pgcol(r, i, "languages"));
+      obj_key(&o, "topics");
+      json_str_array_from_pgjson(out, pgcol(r, i, "topics"));
+      obj_end(&o);
+      collect_from_json_array(pgcol(r, i, "languages"), langs, &nlang);
+      collect_from_json_array(pgcol(r, i, "topics"), topics, &ntop);
+      (*ntalks)++;
+    }
+  }
+  buf_puts(out, "]");
+  if (r) PQclear(r);
+}
+
+static void years_json(PGconn *c, const char *sql, const char *slug, Buf *out) {
+  const char *vals[1] = {slug};
+  PGresult *r = exec_params(c, sql, 1, vals);
+  buf_puts(out, "[");
+  int n = 0;
+  if (res_ok(r)) {
+    for (int i = 0; i < PQntuples(r); i++) {
+      if (n) buf_puts(out, ",");
+      buf_printf(out, "%d", as_int(pgcol(r, i, "year")));
+      n++;
+    }
+  }
+  buf_puts(out, "]");
+  if (r) PQclear(r);
+}
+
+static void other_years_json(PGconn *c, const char *sql, const char *slug, int year, Buf *out) {
+  const char *vals[1] = {slug};
+  PGresult *r = exec_params(c, sql, 1, vals);
+  buf_puts(out, "[");
+  int n = 0;
+  if (res_ok(r)) {
+    for (int i = 0; i < PQntuples(r); i++) {
+      int y = as_int(pgcol(r, i, "year"));
+      if (y == year) continue;
+      if (n) buf_puts(out, ",");
+      buf_printf(out, "%d", y);
+      n++;
+    }
+  }
+  buf_puts(out, "]");
+  if (r) PQclear(r);
+}
+
+static void sponsorships_json(PGconn *c, const char *slug, Buf *out) {
+  const char *vals[1] = {slug};
+  PGresult *r = exec_params(c,
+                            "SELECT sponsor_slug, year, tier, blurb, featured FROM v1_sponsorships "
+                            "WHERE sponsor_slug = $1 ORDER BY year DESC",
+                            1, vals);
+  buf_puts(out, "[");
+  int n = 0;
+  if (res_ok(r)) {
+    for (int i = 0; i < PQntuples(r); i++) {
+      if (n) buf_puts(out, ",");
+      Obj o;
+      obj_begin(&o, out);
+      obj_str(&o, "sponsor_slug", pgcol(r, i, "sponsor_slug"));
+      obj_int(&o, "year", as_int(pgcol(r, i, "year")));
+      obj_str(&o, "tier", pgcol(r, i, "tier"));
+      obj_str(&o, "blurb", pgcol(r, i, "blurb"));
+      obj_bool(&o, "featured", truthy(pgcol(r, i, "featured")));
+      obj_end(&o);
+      n++;
+    }
+  }
+  buf_puts(out, "]");
+  if (r) PQclear(r);
+}
+
+static void identity_json(Buf *b) {
+  Obj o;
+  obj_begin(&o, b);
+  obj_str(&o, "language", kLanguage);
+  obj_str(&o, "language_version", kLanguageVersion);
+  obj_str(&o, "api_version", kApiVersion);
+  obj_str(&o, "framework", kFramework);
+  obj_int(&o, "created_year", kCreatedYear);
+  obj_int(&o, "schema_version", kSchemaVersion);
+  obj_raw(&o, "endpoints", kEndpointsJson);
+  obj_end(&o);
+}
+
+static int all_digits(const char *s) {
+  if (!s || !*s) return 0;
+  for (; *s; s++)
+    if (!isdigit((unsigned char)*s)) return 0;
+  return 1;
+}
+
+static void url_decode(char *s) {
+  char *d = s;
+  while (*s) {
+    if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+      char hex[3] = {s[1], s[2], 0};
+      *d++ = (char)strtol(hex, NULL, 16);
+      s += 3;
+    } else if (*s == '+') {
+      *d++ = ' ';
+      s++;
+    } else {
+      *d++ = *s++;
+    }
+  }
+  *d = 0;
+}
+
+static char *query_get(char *qs, const char *key) {
+  if (!qs) return NULL;
+  char *p = qs;
+  while (p && *p) {
+    char *amp = strchr(p, '&');
+    if (amp) *amp = 0;
+    char *eq = strchr(p, '=');
+    if (eq) {
+      *eq = 0;
+      url_decode(p);
+      url_decode(eq + 1);
+      if (strcmp(p, key) == 0) return eq + 1;
+    }
+    p = amp ? amp + 1 : NULL;
+  }
+  return NULL;
+}
+
+static int split_path(char *path, char **parts, int max) {
+  int n = 0;
+  char *p = path;
+  if (*p == '/') p++;
+  if (!*p) return 0;
+  while (*p && n < max) {
+    parts[n++] = p;
+    char *slash = strchr(p, '/');
+    if (!slash) break;
+    *slash = 0;
+    p = slash + 1;
+    if (!*p) break;
+  }
+  return n;
+}
+
+typedef struct {
+  int status;
+  Buf body;
+} Reply;
+
+static void reply_init(Reply *r, int status) {
+  r->status = status;
+  buf_init(&r->body);
+}
+
+static PGconn *db_connect(Reply *out) {
+  PGconn *c = PQconnectdb(g_dsn);
+  if (!c || PQstatus(c) != CONNECTION_OK) {
+    out->status = 500;
+    buf_free(&out->body);
+    buf_init(&out->body);
+    Obj o;
+    obj_begin(&o, &out->body);
+    obj_str(&o, "error", c ? PQerrorMessage(c) : "connect failed");
+    obj_end(&o);
+    if (c) PQfinish(c);
+    return NULL;
+  }
+  return c;
+}
+
+static void fail_sql(Reply *out, PGresult *r) {
+  out->status = 500;
+  buf_free(&out->body);
+  buf_init(&out->body);
+  Obj o;
+  obj_begin(&o, &out->body);
+  obj_str(&o, "error", r ? PQresultErrorMessage(r) : "query failed");
+  obj_end(&o);
+}
+
+static void not_found(Reply *out) {
+  out->status = 404;
+  buf_free(&out->body);
+  buf_init(&out->body);
+  buf_puts(&out->body, "{\"error\":\"not_found\"}");
+}
+
+static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
+  char path[1024];
+  char qsbuf[1024];
+  snprintf(path, sizeof(path), "%s", path_in ? path_in : "/");
+  snprintf(qsbuf, sizeof(qsbuf), "%s", qs_in ? qs_in : "");
+  url_decode(path);
+  char *parts[8] = {0};
+  int nparts = split_path(path, parts, 8);
+  char *year_q = query_get(qsbuf, "year");
+
+  reply_init(out, 200);
+
+  if (nparts == 0) {
+    identity_json(&out->body);
+    return;
+  }
+  if (nparts == 1 && strcmp(parts[0], "health") == 0) {
+    buf_puts(&out->body, "{\"ok\":true}");
+    return;
+  }
+
+  PGconn *c = db_connect(out);
+  if (!c) return;
+
+  if (nparts == 2 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "years") == 0) {
+    PGresult *r = PQexec(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC");
+    if (!res_ok(r)) {
+      fail_sql(out, r);
+      if (r) PQclear(r);
+      PQfinish(c);
+      return;
+    }
+    Obj root;
+    obj_begin(&root, &out->body);
+    obj_key(&root, "data");
+    buf_puts(&out->body, "[");
+    for (int i = 0; i < PQntuples(r); i++) {
+      if (i) buf_puts(&out->body, ",");
+      Obj o;
+      obj_begin(&o, &out->body);
+      obj_int(&o, "year", as_int(pgcol(r, i, "year")));
+      obj_str(&o, "slug", pgcol(r, i, "slug"));
+      obj_str(&o, "name", pgcol(r, i, "name"));
+      obj_str(&o, "status", pgcol(r, i, "status"));
+      obj_end(&o);
+    }
+    buf_puts(&out->body, "]");
+    obj_end(&root);
+    PQclear(r);
+    PQfinish(c);
+    return;
+  }
+
+  if (nparts == 2 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "speakers") == 0) {
+    PGresult *r;
+    char ybuf[16] = {0};
+    if (year_q && *year_q) {
+      snprintf(ybuf, sizeof(ybuf), "%d", atoi(year_q));
+      char sql[1024];
+      snprintf(sql, sizeof(sql),
+               "SELECT %s FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) "
+               "ORDER BY last_name, first_name",
+               kSpeakerCols);
+      const char *vals[1] = {ybuf};
+      r = exec_params(c, sql, 1, vals);
+    } else {
+      char sql[1024];
+      snprintf(sql, sizeof(sql), "SELECT %s FROM v1_speakers ORDER BY last_name, first_name", kSpeakerCols);
+      r = PQexec(c, sql);
+    }
+    if (!res_ok(r)) {
+      fail_sql(out, r);
+      if (r) PQclear(r);
+      PQfinish(c);
+      return;
+    }
+    Obj root;
+    obj_begin(&root, &out->body);
+    obj_key(&root, "data");
+    buf_puts(&out->body, "[");
+    for (int i = 0; i < PQntuples(r); i++) {
+      if (i) buf_puts(&out->body, ",");
+      Obj o;
+      obj_begin(&o, &out->body);
+      speaker_fields(&o, r, i);
+      if (year_q && *year_q) {
+        const char *slug = pgcol(r, i, "slug");
+        Buf talks, langs, topics;
+        buf_init(&talks);
+        buf_init(&langs);
+        buf_init(&topics);
+        int nt = 0;
+        talks_json(c, slug ? slug : "", ybuf, &talks, &langs, &topics, &nt);
+        obj_int(&o, "year", atoi(ybuf));
+        obj_raw(&o, "talks", talks.s);
+        buf_puts(&langs, ""); /* ensure */
+        Buf langarr, toparr, years;
+        buf_init(&langarr);
+        buf_init(&toparr);
+        buf_init(&years);
+        buf_puts(&langarr, "[");
+        if (langs.s) buf_puts(&langarr, langs.s);
+        buf_puts(&langarr, "]");
+        buf_puts(&toparr, "[");
+        if (topics.s) buf_puts(&toparr, topics.s);
+        buf_puts(&toparr, "]");
+        years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC",
+                   slug ? slug : "", &years);
+        obj_raw(&o, "languages", langarr.s);
+        obj_raw(&o, "topics", toparr.s);
+        obj_raw(&o, "years", years.s);
+        buf_free(&talks);
+        buf_free(&langs);
+        buf_free(&topics);
+        buf_free(&langarr);
+        buf_free(&toparr);
+        buf_free(&years);
+      }
+      obj_end(&o);
+    }
+    buf_puts(&out->body, "]");
+    obj_end(&root);
+    PQclear(r);
+    PQfinish(c);
+    return;
+  }
+
+  if (nparts == 4 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "speakers") == 0 && all_digits(parts[2])) {
+    char ybuf[16];
+    snprintf(ybuf, sizeof(ybuf), "%d", atoi(parts[2]));
+    const char *slug = parts[3];
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM v1_speakers WHERE slug = $1", kSpeakerCols);
+    const char *vals[1] = {slug};
+    PGresult *r = exec_params(c, sql, 1, vals);
+    if (!res_ok(r)) {
+      fail_sql(out, r);
+      if (r) PQclear(r);
+      PQfinish(c);
+      return;
+    }
+    if (PQntuples(r) == 0) {
+      PQclear(r);
+      PQfinish(c);
+      not_found(out);
+      return;
+    }
+    Buf talks, langs, topics, years, other;
+    buf_init(&talks);
+    buf_init(&langs);
+    buf_init(&topics);
+    buf_init(&years);
+    buf_init(&other);
+    int nt = 0;
+    talks_json(c, slug, ybuf, &talks, &langs, &topics, &nt);
+    if (nt == 0) {
+      buf_free(&talks);
+      buf_free(&langs);
+      buf_free(&topics);
+      buf_free(&years);
+      buf_free(&other);
+      PQclear(r);
+      PQfinish(c);
+      not_found(out);
+      return;
+    }
+    years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug, &years);
+    other_years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug,
+                     atoi(ybuf), &other);
+    Buf langarr, toparr;
+    buf_init(&langarr);
+    buf_init(&toparr);
+    buf_puts(&langarr, "[");
+    if (langs.s) buf_puts(&langarr, langs.s);
+    buf_puts(&langarr, "]");
+    buf_puts(&toparr, "[");
+    if (topics.s) buf_puts(&toparr, topics.s);
+    buf_puts(&toparr, "]");
+    Obj root;
+    obj_begin(&root, &out->body);
+    obj_key(&root, "data");
+    Obj o;
+    obj_begin(&o, &out->body);
+    speaker_fields(&o, r, 0);
+    obj_int(&o, "year", atoi(ybuf));
+    obj_raw(&o, "years", years.s);
+    obj_raw(&o, "other_years", other.s);
+    obj_raw(&o, "talks", talks.s);
+    obj_raw(&o, "languages", langarr.s);
+    obj_raw(&o, "topics", toparr.s);
+    obj_end(&o);
+    obj_end(&root);
+    buf_free(&talks);
+    buf_free(&langs);
+    buf_free(&topics);
+    buf_free(&years);
+    buf_free(&other);
+    buf_free(&langarr);
+    buf_free(&toparr);
+    PQclear(r);
+    PQfinish(c);
+    return;
+  }
+
+  if (nparts == 3 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "speakers") == 0) {
+    const char *slug = parts[2];
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM v1_speakers WHERE slug = $1", kSpeakerCols);
+    const char *vals[1] = {slug};
+    PGresult *r = exec_params(c, sql, 1, vals);
+    if (!res_ok(r)) {
+      fail_sql(out, r);
+      if (r) PQclear(r);
+      PQfinish(c);
+      return;
+    }
+    if (PQntuples(r) == 0) {
+      PQclear(r);
+      PQfinish(c);
+      not_found(out);
+      return;
+    }
+    Buf talks, langs, topics, years;
+    buf_init(&talks);
+    buf_init(&langs);
+    buf_init(&topics);
+    buf_init(&years);
+    int nt = 0;
+    talks_json(c, slug, NULL, &talks, &langs, &topics, &nt);
+    years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug, &years);
+    Obj root;
+    obj_begin(&root, &out->body);
+    obj_key(&root, "data");
+    Obj o;
+    obj_begin(&o, &out->body);
+    speaker_fields(&o, r, 0);
+    obj_raw(&o, "talks", talks.s);
+    obj_raw(&o, "years", years.s);
+    obj_end(&o);
+    obj_end(&root);
+    buf_free(&talks);
+    buf_free(&langs);
+    buf_free(&topics);
+    buf_free(&years);
+    PQclear(r);
+    PQfinish(c);
+    return;
+  }
+
+  if (nparts == 2 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "sponsors") == 0) {
+    PGresult *r;
+    if (year_q && *year_q) {
+      char ybuf[16];
+      snprintf(ybuf, sizeof(ybuf), "%d", atoi(year_q));
+      char sql[1024];
+      snprintf(sql, sizeof(sql), "SELECT %s FROM v1_year_sponsors WHERE year = $1 ORDER BY name", kYearSponsorCols);
+      const char *vals[1] = {ybuf};
+      r = exec_params(c, sql, 1, vals);
+    } else {
+      char sql[1024];
+      snprintf(sql, sizeof(sql), "SELECT %s FROM v1_sponsors ORDER BY name", kSponsorCols);
+      r = PQexec(c, sql);
+    }
+    if (!res_ok(r)) {
+      fail_sql(out, r);
+      if (r) PQclear(r);
+      PQfinish(c);
+      return;
+    }
+    Obj root;
+    obj_begin(&root, &out->body);
+    obj_key(&root, "data");
+    buf_puts(&out->body, "[");
+    for (int i = 0; i < PQntuples(r); i++) {
+      if (i) buf_puts(&out->body, ",");
+      Obj o;
+      obj_begin(&o, &out->body);
+      if (year_q && *year_q) year_sponsor_fields(&o, r, i);
+      else sponsor_fields(&o, r, i);
+      obj_end(&o);
+    }
+    buf_puts(&out->body, "]");
+    obj_end(&root);
+    PQclear(r);
+    PQfinish(c);
+    return;
+  }
+
+  if (nparts == 4 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "sponsors") == 0 && all_digits(parts[2])) {
+    char ybuf[16];
+    snprintf(ybuf, sizeof(ybuf), "%d", atoi(parts[2]));
+    const char *slug = parts[3];
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM v1_year_sponsors WHERE year = $1 AND slug = $2", kYearSponsorCols);
+    const char *vals[2] = {ybuf, slug};
+    PGresult *r = exec_params(c, sql, 2, vals);
+    if (!res_ok(r)) {
+      fail_sql(out, r);
+      if (r) PQclear(r);
+      PQfinish(c);
+      return;
+    }
+    if (PQntuples(r) == 0) {
+      PQclear(r);
+      PQfinish(c);
+      not_found(out);
+      return;
+    }
+    Buf years, other;
+    buf_init(&years);
+    buf_init(&other);
+    years_json(c, "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC", slug,
+               &years);
+    other_years_json(c, "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC", slug,
+                     atoi(ybuf), &other);
+    Obj root;
+    obj_begin(&root, &out->body);
+    obj_key(&root, "data");
+    Obj o;
+    obj_begin(&o, &out->body);
+    year_sponsor_fields(&o, r, 0);
+    obj_raw(&o, "years", years.s);
+    obj_raw(&o, "other_years", other.s);
+    obj_end(&o);
+    obj_end(&root);
+    buf_free(&years);
+    buf_free(&other);
+    PQclear(r);
+    PQfinish(c);
+    return;
+  }
+
+  if (nparts == 3 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "sponsors") == 0) {
+    const char *slug = parts[2];
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM v1_sponsors WHERE slug = $1", kSponsorCols);
+    const char *vals[1] = {slug};
+    PGresult *r = exec_params(c, sql, 1, vals);
+    if (!res_ok(r)) {
+      fail_sql(out, r);
+      if (r) PQclear(r);
+      PQfinish(c);
+      return;
+    }
+    if (PQntuples(r) == 0) {
+      PQclear(r);
+      PQfinish(c);
+      not_found(out);
+      return;
+    }
+    Buf sps;
+    buf_init(&sps);
+    sponsorships_json(c, slug, &sps);
+    Obj root;
+    obj_begin(&root, &out->body);
+    obj_key(&root, "data");
+    Obj o;
+    obj_begin(&o, &out->body);
+    sponsor_fields(&o, r, 0);
+    obj_raw(&o, "sponsorships", sps.s);
+    obj_end(&o);
+    obj_end(&root);
+    buf_free(&sps);
+    PQclear(r);
+    PQfinish(c);
+    return;
+  }
+
+  PQfinish(c);
+  not_found(out);
+}
+
+static const char *status_text(int code) {
+  switch (code) {
+    case 200: return "OK";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 500: return "Internal Server Error";
+    default: return "OK";
+  }
+}
+
+static void write_http(int fd, int status, const char *body, size_t n) {
+  char hdr[512];
+  int hn = snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.1 %d %s\r\n"
+                    "Content-Type: application/json\r\n"
+                    "X-Polyglot-Language: %s\r\n"
+                    "X-Polyglot-Framework: %s\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Connection: close\r\n"
+                    "\r\n",
+                    status, status_text(status), kLanguage, kFramework, n);
+  if (hn > 0) (void)send(fd, hdr, (size_t)hn, 0);
+  if (n && body) (void)send(fd, body, n, 0);
+}
+
+static void handle_client(int fd) {
+  char buf[8192];
+  size_t n = 0;
+  struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  while (n < sizeof(buf) - 1) {
+    ssize_t r = recv(fd, buf + n, sizeof(buf) - 1 - n, 0);
+    if (r <= 0) break;
+    n += (size_t)r;
+    buf[n] = 0;
+    if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) break;
+  }
+  buf[n] = 0;
+  char method[16] = {0}, target[2048] = {0}, ver[16] = {0};
+  if (sscanf(buf, "%15s %2047s %15s", method, target, ver) != 3) {
+    write_http(fd, 400, "{\"error\":\"bad_request\"}", 24);
+    return;
+  }
+  if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+    write_http(fd, 405, "{\"error\":\"method_not_allowed\"}", 31);
+    return;
+  }
+  char *q = strchr(target, '?');
+  const char *qs = "";
+  if (q) {
+    *q = 0;
+    qs = q + 1;
+  }
+  Reply reply;
+  handle_get(target, qs, &reply);
+  const char *body = reply.body.s ? reply.body.s : "";
+  size_t blen = reply.body.n;
+  if (strcmp(method, "HEAD") == 0) blen = 0;
+  write_http(fd, reply.status, body, blen);
+  buf_free(&reply.body);
+}
+
+static void *worker(void *arg) {
+  int fd = *(int *)arg;
+  free(arg);
+  handle_client(fd);
+  close(fd);
+  return NULL;
+}
+
+static int http_post(const char *host, const char *port, const char *path, const char *token, const char *body) {
+  struct addrinfo hints, *res = NULL;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+  if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+  int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (fd < 0) {
+    freeaddrinfo(res);
+    return -1;
+  }
+  struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    close(fd);
+    freeaddrinfo(res);
+    return -1;
+  }
+  freeaddrinfo(res);
+  char hdr[1024];
+  int hn = snprintf(hdr, sizeof(hdr),
+                    "POST %s HTTP/1.1\r\n"
+                    "Host: %s:%s\r\n"
+                    "Authorization: Bearer %s\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Connection: close\r\n"
+                    "\r\n",
+                    path, host, port, token, strlen(body));
+  if (hn < 0 || send(fd, hdr, (size_t)hn, 0) < 0 || send(fd, body, strlen(body), 0) < 0) {
+    close(fd);
+    return -1;
+  }
+  char resp[256];
+  ssize_t n = recv(fd, resp, sizeof(resp) - 1, 0);
+  if (n > 0) {
+    resp[n] = 0;
+    char *sp = strchr(resp, ' ');
+    fprintf(stderr, "registered with elixir: %s\n", sp ? sp + 1 : resp);
+  }
+  close(fd);
+  return 0;
+}
+
+static void parse_origin(const char *url, char *host, size_t hsz, char *port, size_t psz) {
+  snprintf(host, hsz, "127.0.0.1");
+  snprintf(port, psz, "4000");
+  const char *p = url;
+  if (strncmp(p, "http://", 7) == 0) p += 7;
+  else if (strncmp(p, "https://", 8) == 0) p += 8;
+  char tmp[256];
+  snprintf(tmp, sizeof(tmp), "%s", p);
+  char *slash = strchr(tmp, '/');
+  if (slash) *slash = 0;
+  char *colon = strrchr(tmp, ':');
+  if (colon && colon != tmp && !(tmp[0] == '[' && colon[-1] != ']')) {
+    *colon = 0;
+    snprintf(host, hsz, "%s", tmp);
+    snprintf(port, psz, "%s", colon + 1);
+  } else {
+    snprintf(host, hsz, "%s", tmp);
+    snprintf(port, psz, "80");
+  }
+}
+
+static void *register_thread(void *arg) {
+  (void)arg;
+  struct timespec ts = {.tv_sec = 0, .tv_nsec = 200000000L};
+  nanosleep(&ts, NULL);
+  const char *url = getenv("CAROLINA_URL");
+  const char *token = getenv("POLYGLOT_REGISTER_TOKEN");
+  if (!url || !*url || !token || !*token) return NULL;
+  char host[256], port[16], base[256];
+  parse_origin(url, host, sizeof(host), port, sizeof(port));
+  const char *pub = getenv("PUBLIC_BASE_URL");
+  if (pub && *pub) snprintf(base, sizeof(base), "%s", pub);
+  else snprintf(base, sizeof(base), "http://127.0.0.1:%s", g_port);
+  Buf body;
+  buf_init(&body);
+  Obj o;
+  obj_begin(&o, &body);
+  obj_str(&o, "language", kLanguage);
+  obj_str(&o, "language_version", kLanguageVersion);
+  obj_str(&o, "api_version", kApiVersion);
+  obj_str(&o, "framework", kFramework);
+  obj_int(&o, "created_year", kCreatedYear);
+  obj_int(&o, "schema_version", kSchemaVersion);
+  obj_str(&o, "base_url", base);
+  obj_raw(&o, "endpoints", kEndpointsJson);
+  obj_end(&o);
+  if (http_post(host, port, "/internal/api-endpoints/register", token, body.s) != 0)
+    fprintf(stderr, "register: failed\n");
+  buf_free(&body);
+  return NULL;
+}
+
+int main(void) {
+  signal(SIGPIPE, SIG_IGN);
+  snprintf(g_dsn, sizeof(g_dsn), "%s", env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev"));
+  snprintf(g_port, sizeof(g_port), "%s", env_or("PORT", "4014"));
+  int port = atoi(g_port);
+  if (port <= 0) port = 4014;
+
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    perror("socket");
+    return 1;
+  }
+  int yes = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons((uint16_t)port);
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    perror("bind");
+    return 1;
+  }
+  if (listen(fd, 128) != 0) {
+    perror("listen");
+    return 1;
+  }
+
+  pthread_t rt;
+  pthread_create(&rt, NULL, register_thread, NULL);
+  pthread_detach(rt);
+
+  fprintf(stderr, "carolina-codes-c listening on :%d\n", port);
+  for (;;) {
+    struct sockaddr_in cli;
+    socklen_t clen = sizeof(cli);
+    int cfd = accept(fd, (struct sockaddr *)&cli, &clen);
+    if (cfd < 0) {
+      if (errno == EINTR) continue;
+      perror("accept");
+      continue;
+    }
+    int *arg = malloc(sizeof(int));
+    if (!arg) {
+      close(cfd);
+      continue;
+    }
+    *arg = cfd;
+    pthread_t t;
+    if (pthread_create(&t, NULL, worker, arg) != 0) {
+      close(cfd);
+      free(arg);
+      continue;
+    }
+    pthread_detach(t);
+  }
+}
