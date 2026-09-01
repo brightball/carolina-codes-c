@@ -70,6 +70,16 @@ static const char *kEndpointsJson =
 static char g_dsn[512];
 static char g_port[16];
 
+#define DB_POOL_SIZE 8
+
+static pthread_mutex_t g_db_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_db_cv = PTHREAD_COND_INITIALIZER;
+static PGconn *g_db_pool[DB_POOL_SIZE];
+static int g_db_busy[DB_POOL_SIZE];
+static int g_sql_count;
+static int g_connect_count;
+static PGconn *(*g_connect_fn)(const char *) = NULL;
+
 static const char *env_or(const char *key, const char *fallback) {
   const char *v = getenv(key);
   return (v && *v) ? v : fallback;
@@ -208,7 +218,67 @@ static int truthy(const char *v) { return v && (v[0] == 't' || v[0] == 'T' || v[
 static int as_int(const char *v) { return v ? atoi(v) : 0; }
 
 static PGresult *exec_params(PGconn *c, const char *sql, int n, const char **vals) {
+  g_sql_count++;
   return PQexecParams(c, sql, n, NULL, vals, NULL, NULL, 0);
+}
+
+static PGresult *db_exec(PGconn *c, const char *sql) {
+  g_sql_count++;
+  return PQexec(c, sql);
+}
+
+static int conn_ok(PGconn *c) {
+  if (!c) return 0;
+  if (g_connect_fn) return 1;
+  return PQstatus(c) == CONNECTION_OK;
+}
+
+static PGconn *do_connect(void) {
+  g_connect_count++;
+  if (g_connect_fn) return g_connect_fn(g_dsn);
+  return PQconnectdb(g_dsn);
+}
+
+static PGconn *db_acquire(void) {
+  pthread_mutex_lock(&g_db_mu);
+  for (;;) {
+    int busy = 0;
+    for (int i = 0; i < DB_POOL_SIZE; i++) {
+      if (g_db_busy[i]) {
+        busy++;
+        continue;
+      }
+      if (!conn_ok(g_db_pool[i])) {
+        if (g_db_pool[i] && !g_connect_fn) PQfinish(g_db_pool[i]);
+        g_db_pool[i] = do_connect();
+      }
+      if (conn_ok(g_db_pool[i])) {
+        g_db_busy[i] = 1;
+        PGconn *c = g_db_pool[i];
+        pthread_mutex_unlock(&g_db_mu);
+        return c;
+      }
+      g_db_pool[i] = NULL;
+    }
+    if (busy == 0) {
+      pthread_mutex_unlock(&g_db_mu);
+      return NULL;
+    }
+    pthread_cond_wait(&g_db_cv, &g_db_mu);
+  }
+}
+
+static void db_release(PGconn *c) {
+  if (!c) return;
+  pthread_mutex_lock(&g_db_mu);
+  for (int i = 0; i < DB_POOL_SIZE; i++) {
+    if (g_db_pool[i] == c) {
+      g_db_busy[i] = 0;
+      break;
+    }
+  }
+  pthread_cond_signal(&g_db_cv);
+  pthread_mutex_unlock(&g_db_mu);
 }
 
 static int res_ok(PGresult *r) {
@@ -396,6 +466,152 @@ static void other_years_json(PGconn *c, const char *sql, const char *slug, int y
   if (r) PQclear(r);
 }
 
+typedef struct {
+  Buf talks;
+  Buf langs;
+  Buf topics;
+  Buf years;
+  int ntalks, nlang, ntop, nyears;
+} YearExtras;
+
+static int speaker_row_for_slug(PGresult *speakers, const char *slug) {
+  if (!slug) return -1;
+  for (int i = 0; i < PQntuples(speakers); i++) {
+    const char *s = pgcol(speakers, i, "slug");
+    if (s && strcmp(s, slug) == 0) return i;
+  }
+  return -1;
+}
+
+static void pg_slug_array(PGresult *speakers, Buf *out) {
+  buf_puts(out, "{");
+  int n = 0;
+  for (int i = 0; i < PQntuples(speakers); i++) {
+    const char *slug = pgcol(speakers, i, "slug");
+    if (!slug || !*slug) continue;
+    if (n) buf_puts(out, ",");
+    buf_puts(out, "\"");
+    buf_puts(out, slug);
+    buf_puts(out, "\"");
+    n++;
+  }
+  buf_puts(out, "}");
+}
+
+static void load_year_extras(PGconn *c, const char *ybuf, PGresult *speakers, YearExtras *ex) {
+  int n = PQntuples(speakers);
+  if (n <= 0) return;
+
+  char talks_sql[1024];
+  snprintf(talks_sql, sizeof(talks_sql),
+           "SELECT %s FROM v1_talks WHERE year = $1 ORDER BY speaker_slug, year DESC", kTalkSelect);
+  const char *tvals[1] = {ybuf};
+  PGresult *talks = exec_params(c, talks_sql, 1, tvals);
+  if (res_ok(talks)) {
+    for (int i = 0; i < PQntuples(talks); i++) {
+      int row = speaker_row_for_slug(speakers, pgcol(talks, i, "speaker_slug"));
+      if (row < 0) continue;
+      YearExtras *e = &ex[row];
+      if (e->ntalks) buf_puts(&e->talks, ",");
+      Obj o;
+      obj_begin(&o, &e->talks);
+      obj_str(&o, "slug", pgcol(talks, i, "slug"));
+      obj_str(&o, "title", pgcol(talks, i, "title"));
+      obj_str(&o, "description", pgcol(talks, i, "description"));
+      obj_str(&o, "format", pgcol(talks, i, "format"));
+      obj_str(&o, "youtube_id", pgcol(talks, i, "youtube_id"));
+      obj_int(&o, "year", as_int(pgcol(talks, i, "year")));
+      obj_str(&o, "speaker_slug", pgcol(talks, i, "speaker_slug"));
+      obj_key(&o, "languages");
+      json_str_array_from_pgjson(&e->talks, pgcol(talks, i, "languages"));
+      obj_key(&o, "topics");
+      json_str_array_from_pgjson(&e->talks, pgcol(talks, i, "topics"));
+      obj_end(&o);
+      collect_from_json_array(pgcol(talks, i, "languages"), &e->langs, &e->nlang);
+      collect_from_json_array(pgcol(talks, i, "topics"), &e->topics, &e->ntop);
+      e->ntalks++;
+    }
+  }
+  if (talks) PQclear(talks);
+
+  Buf slugs;
+  buf_init(&slugs);
+  pg_slug_array(speakers, &slugs);
+  const char *yvals[1] = {slugs.s};
+  PGresult *yrs = exec_params(
+      c,
+      "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY($1::text[]) "
+      "ORDER BY speaker_slug, year DESC",
+      1, yvals);
+  if (res_ok(yrs)) {
+    for (int i = 0; i < PQntuples(yrs); i++) {
+      int row = speaker_row_for_slug(speakers, pgcol(yrs, i, "speaker_slug"));
+      if (row < 0) continue;
+      YearExtras *e = &ex[row];
+      if (e->nyears) buf_puts(&e->years, ",");
+      buf_printf(&e->years, "%d", as_int(pgcol(yrs, i, "year")));
+      e->nyears++;
+    }
+  }
+  if (yrs) PQclear(yrs);
+  buf_free(&slugs);
+}
+
+static void write_year_speaker_list(PGconn *c, const char *ybuf, PGresult *speakers, Buf *body) {
+  int n = PQntuples(speakers);
+  YearExtras *ex = calloc((size_t)(n > 0 ? n : 1), sizeof(*ex));
+  if (!ex) abort();
+  for (int i = 0; i < n; i++) {
+    buf_init(&ex[i].talks);
+    buf_init(&ex[i].langs);
+    buf_init(&ex[i].topics);
+    buf_init(&ex[i].years);
+    buf_puts(&ex[i].talks, "[");
+  }
+  load_year_extras(c, ybuf, speakers, ex);
+
+  Obj root;
+  obj_begin(&root, body);
+  obj_key(&root, "data");
+  buf_puts(body, "[");
+  for (int i = 0; i < n; i++) {
+    if (i) buf_puts(body, ",");
+    buf_puts(&ex[i].talks, "]");
+    Buf langarr, toparr, years;
+    buf_init(&langarr);
+    buf_init(&toparr);
+    buf_init(&years);
+    buf_puts(&langarr, "[");
+    if (ex[i].langs.s) buf_puts(&langarr, ex[i].langs.s);
+    buf_puts(&langarr, "]");
+    buf_puts(&toparr, "[");
+    if (ex[i].topics.s) buf_puts(&toparr, ex[i].topics.s);
+    buf_puts(&toparr, "]");
+    buf_puts(&years, "[");
+    if (ex[i].years.s) buf_puts(&years, ex[i].years.s);
+    buf_puts(&years, "]");
+    Obj o;
+    obj_begin(&o, body);
+    speaker_fields(&o, speakers, i);
+    obj_int(&o, "year", atoi(ybuf));
+    obj_raw(&o, "talks", ex[i].talks.s);
+    obj_raw(&o, "languages", langarr.s);
+    obj_raw(&o, "topics", toparr.s);
+    obj_raw(&o, "years", years.s);
+    obj_end(&o);
+    buf_free(&langarr);
+    buf_free(&toparr);
+    buf_free(&years);
+    buf_free(&ex[i].talks);
+    buf_free(&ex[i].langs);
+    buf_free(&ex[i].topics);
+    buf_free(&ex[i].years);
+  }
+  buf_puts(body, "]");
+  obj_end(&root);
+  free(ex);
+}
+
 static void sponsorships_json(PGconn *c, const char *slug, Buf *out) {
   const char *vals[1] = {slug};
   PGresult *r = exec_params(c,
@@ -503,20 +719,14 @@ static void reply_init(Reply *r, int status) {
   buf_init(&r->body);
 }
 
-static PGconn *db_connect(Reply *out) {
-  PGconn *c = PQconnectdb(g_dsn);
-  if (!c || PQstatus(c) != CONNECTION_OK) {
-    out->status = 500;
-    buf_free(&out->body);
-    buf_init(&out->body);
-    Obj o;
-    obj_begin(&o, &out->body);
-    obj_str(&o, "error", c ? PQerrorMessage(c) : "connect failed");
-    obj_end(&o);
-    if (c) PQfinish(c);
-    return NULL;
-  }
-  return c;
+static void connect_failed(Reply *out) {
+  out->status = 500;
+  buf_free(&out->body);
+  buf_init(&out->body);
+  Obj o;
+  obj_begin(&o, &out->body);
+  obj_str(&o, "error", "connect failed");
+  obj_end(&o);
 }
 
 static void fail_sql(Reply *out, PGresult *r) {
@@ -557,15 +767,18 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     return;
   }
 
-  PGconn *c = db_connect(out);
-  if (!c) return;
+  PGconn *c = db_acquire();
+  if (!c) {
+    connect_failed(out);
+    return;
+  }
 
   if (nparts == 2 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "years") == 0) {
-    PGresult *r = PQexec(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC");
+    PGresult *r = db_exec(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC");
     if (!res_ok(r)) {
       fail_sql(out, r);
       if (r) PQclear(r);
-      PQfinish(c);
+      db_release(c);
       return;
     }
     Obj root;
@@ -585,7 +798,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_puts(&out->body, "]");
     obj_end(&root);
     PQclear(r);
-    PQfinish(c);
+    db_release(c);
     return;
   }
 
@@ -604,12 +817,18 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     } else {
       char sql[1024];
       snprintf(sql, sizeof(sql), "SELECT %s FROM v1_speakers ORDER BY last_name, first_name", kSpeakerCols);
-      r = PQexec(c, sql);
+      r = db_exec(c, sql);
     }
     if (!res_ok(r)) {
       fail_sql(out, r);
       if (r) PQclear(r);
-      PQfinish(c);
+      db_release(c);
+      return;
+    }
+    if (year_q && *year_q) {
+      write_year_speaker_list(c, ybuf, r, &out->body);
+      PQclear(r);
+      db_release(c);
       return;
     }
     Obj root;
@@ -621,45 +840,12 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
       Obj o;
       obj_begin(&o, &out->body);
       speaker_fields(&o, r, i);
-      if (year_q && *year_q) {
-        const char *slug = pgcol(r, i, "slug");
-        Buf talks, langs, topics;
-        buf_init(&talks);
-        buf_init(&langs);
-        buf_init(&topics);
-        int nt = 0;
-        talks_json(c, slug ? slug : "", ybuf, &talks, &langs, &topics, &nt);
-        obj_int(&o, "year", atoi(ybuf));
-        obj_raw(&o, "talks", talks.s);
-        buf_puts(&langs, ""); /* ensure */
-        Buf langarr, toparr, years;
-        buf_init(&langarr);
-        buf_init(&toparr);
-        buf_init(&years);
-        buf_puts(&langarr, "[");
-        if (langs.s) buf_puts(&langarr, langs.s);
-        buf_puts(&langarr, "]");
-        buf_puts(&toparr, "[");
-        if (topics.s) buf_puts(&toparr, topics.s);
-        buf_puts(&toparr, "]");
-        years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC",
-                   slug ? slug : "", &years);
-        obj_raw(&o, "languages", langarr.s);
-        obj_raw(&o, "topics", toparr.s);
-        obj_raw(&o, "years", years.s);
-        buf_free(&talks);
-        buf_free(&langs);
-        buf_free(&topics);
-        buf_free(&langarr);
-        buf_free(&toparr);
-        buf_free(&years);
-      }
       obj_end(&o);
     }
     buf_puts(&out->body, "]");
     obj_end(&root);
     PQclear(r);
-    PQfinish(c);
+    db_release(c);
     return;
   }
 
@@ -674,12 +860,12 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     if (!res_ok(r)) {
       fail_sql(out, r);
       if (r) PQclear(r);
-      PQfinish(c);
+      db_release(c);
       return;
     }
     if (PQntuples(r) == 0) {
       PQclear(r);
-      PQfinish(c);
+      db_release(c);
       not_found(out);
       return;
     }
@@ -698,7 +884,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
       buf_free(&years);
       buf_free(&other);
       PQclear(r);
-      PQfinish(c);
+      db_release(c);
       not_found(out);
       return;
     }
@@ -736,7 +922,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_free(&langarr);
     buf_free(&toparr);
     PQclear(r);
-    PQfinish(c);
+    db_release(c);
     return;
   }
 
@@ -749,12 +935,12 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     if (!res_ok(r)) {
       fail_sql(out, r);
       if (r) PQclear(r);
-      PQfinish(c);
+      db_release(c);
       return;
     }
     if (PQntuples(r) == 0) {
       PQclear(r);
-      PQfinish(c);
+      db_release(c);
       not_found(out);
       return;
     }
@@ -781,7 +967,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_free(&topics);
     buf_free(&years);
     PQclear(r);
-    PQfinish(c);
+    db_release(c);
     return;
   }
 
@@ -797,12 +983,12 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     } else {
       char sql[1024];
       snprintf(sql, sizeof(sql), "SELECT %s FROM v1_sponsors ORDER BY name", kSponsorCols);
-      r = PQexec(c, sql);
+      r = db_exec(c, sql);
     }
     if (!res_ok(r)) {
       fail_sql(out, r);
       if (r) PQclear(r);
-      PQfinish(c);
+      db_release(c);
       return;
     }
     Obj root;
@@ -820,7 +1006,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_puts(&out->body, "]");
     obj_end(&root);
     PQclear(r);
-    PQfinish(c);
+    db_release(c);
     return;
   }
 
@@ -835,12 +1021,12 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     if (!res_ok(r)) {
       fail_sql(out, r);
       if (r) PQclear(r);
-      PQfinish(c);
+      db_release(c);
       return;
     }
     if (PQntuples(r) == 0) {
       PQclear(r);
-      PQfinish(c);
+      db_release(c);
       not_found(out);
       return;
     }
@@ -864,7 +1050,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_free(&years);
     buf_free(&other);
     PQclear(r);
-    PQfinish(c);
+    db_release(c);
     return;
   }
 
@@ -877,12 +1063,12 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     if (!res_ok(r)) {
       fail_sql(out, r);
       if (r) PQclear(r);
-      PQfinish(c);
+      db_release(c);
       return;
     }
     if (PQntuples(r) == 0) {
       PQclear(r);
-      PQfinish(c);
+      db_release(c);
       not_found(out);
       return;
     }
@@ -900,11 +1086,11 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     obj_end(&root);
     buf_free(&sps);
     PQclear(r);
-    PQfinish(c);
+    db_release(c);
     return;
   }
 
-  PQfinish(c);
+  db_release(c);
   not_found(out);
 }
 
@@ -1075,31 +1261,80 @@ static void *register_thread(void *arg) {
   return NULL;
 }
 
+int carolina_listen_family(void) { return AF_INET6; }
+
+int carolina_open_listener(int port) {
+  int fd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  int yes = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  int no = 0;
+  setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
+  struct sockaddr_in6 addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin6_family = AF_INET6;
+  addr.sin6_addr = in6addr_any;
+  addr.sin6_port = htons((uint16_t)port);
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  if (listen(fd, 128) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+void carolina_init(void) {
+  snprintf(g_dsn, sizeof(g_dsn), "%s",
+           env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev"));
+  snprintf(g_port, sizeof(g_port), "%s", env_or("PORT", "4014"));
+}
+
+void carolina_reset_counts(void) {
+  g_sql_count = 0;
+  g_connect_count = 0;
+}
+
+int carolina_sql_count(void) { return g_sql_count; }
+
+int carolina_connect_count(void) { return g_connect_count; }
+
+void carolina_set_connect_fn(PGconn *(*fn)(const char *)) {
+  pthread_mutex_lock(&g_db_mu);
+  for (int i = 0; i < DB_POOL_SIZE; i++) {
+    if (g_db_pool[i] && !g_connect_fn) PQfinish(g_db_pool[i]);
+    g_db_pool[i] = NULL;
+    g_db_busy[i] = 0;
+  }
+  g_connect_fn = fn;
+  pthread_mutex_unlock(&g_db_mu);
+}
+
+PGconn *carolina_db_acquire(void) { return db_acquire(); }
+
+void carolina_db_release(PGconn *c) { db_release(c); }
+
+int carolina_handle_get_copy(const char *path, const char *qs, char *buf, size_t buflen) {
+  Reply reply;
+  handle_get(path, qs, &reply);
+  int status = reply.status;
+  if (buf && buflen) snprintf(buf, buflen, "%s", reply.body.s ? reply.body.s : "");
+  buf_free(&reply.body);
+  return status;
+}
+
+#ifndef CAROLINA_TEST
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
-  snprintf(g_dsn, sizeof(g_dsn), "%s", env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev"));
-  snprintf(g_port, sizeof(g_port), "%s", env_or("PORT", "4014"));
+  carolina_init();
   int port = atoi(g_port);
   if (port <= 0) port = 4014;
 
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  int fd = carolina_open_listener(port);
   if (fd < 0) {
-    perror("socket");
-    return 1;
-  }
-  int yes = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons((uint16_t)port);
-  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
     perror("bind");
-    return 1;
-  }
-  if (listen(fd, 128) != 0) {
-    perror("listen");
     return 1;
   }
 
@@ -1109,7 +1344,7 @@ int main(void) {
 
   fprintf(stderr, "carolina-codes-c listening on :%d\n", port);
   for (;;) {
-    struct sockaddr_in cli;
+    struct sockaddr_in6 cli;
     socklen_t clen = sizeof(cli);
     int cfd = accept(fd, (struct sockaddr *)&cli, &clen);
     if (cfd < 0) {
@@ -1132,3 +1367,4 @@ int main(void) {
     pthread_detach(t);
   }
 }
+#endif
