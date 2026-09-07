@@ -1,0 +1,14 @@
+{
+  "name": "carolina-codes-c",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "install": "make",
+  "ports": [
+    {
+      "name": "api",
+      "port": 4014
+    }
+  ]
+}
