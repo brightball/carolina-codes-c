@@ -25,6 +25,7 @@ jobs:
       image: docker.io/library/debian:bookworm-slim
       env:
         GITHUB_TOKEN: ${{ github.token }}
+        DATABASE_URL: postgres://postgres:postgres@127.0.0.1:1/carolina_dev?connect_timeout=1
     steps:
       - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates gcc make pkg-config libpq-dev libc6-dev
       - run: |
@@ -35,7 +36,19 @@ jobs:
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-      - run: make test
+      - run: |
+          set +e
+          make test > make-test.log 2>&1
+          status=$?
+          set -e
+          cat make-test.log
+          exit $status
+      - if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: make-test-log
+          path: make-test.log
+          if-no-files-found: ignore
 
   sast:
     runs-on: ubuntu-latest

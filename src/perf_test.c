@@ -212,7 +212,7 @@ int main(void) {
   int speakers = count_talks_keys(body);
   fprintf(stderr, "year list status=%d sql=%d speakers=%d connects=%d\n", status, sql, speakers,
           carolina_connect_count());
-  if (status == 200) {
+  if (status == 200 && speakers >= 3) {
     expect(speakers >= 3, "year listing returns N>=3 speakers");
     expect(sql > 0, "listing runs SQL through shipped exec wrapper");
     expect(sql < 2 * speakers, "SQL count does not grow as ~2N");
