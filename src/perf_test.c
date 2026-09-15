@@ -141,15 +141,16 @@ static void test_quality_gates(void) {
   expect(has_substr(wf, "make secrets"), "gitea secrets job runs make secrets");
   expect(has_substr(wf, "make fmt-check"), "gitea fmt job runs make fmt-check");
 
-  char *df = slurp(".gitea/ci.Dockerfile");
-  expect(df != NULL, "can read .gitea/ci.Dockerfile");
-  expect(has_substr(df, "        git \\") && has_substr(df, "ca-certificates"), "CI image installs git and ca-certificates");
-  expect(has_substr(df, "gcc") && has_substr(df, "make") && has_substr(df, "pkg-config") && has_substr(df, "libpq"),
-         "CI image installs gcc/make/pkg-config/libpq headers");
-  expect(has_substr(df, "cppcheck"), "CI image installs cppcheck");
-  expect(has_substr(df, "clang-format"), "CI image installs clang-format");
-  expect(has_substr(df, "gitleaks") && has_substr(df, "v8.30.1"), "CI image installs gitleaks v8.30.1");
-  expect(has_substr(df, "osv-scanner") && has_substr(df, "v2.6.0"), "CI image installs osv-scanner v2.6.0");
+  char *pack = slurp("scripts/ci-pack.sh");
+  char *art = slurp("scripts/ci-artifact.sh");
+  char *restore = slurp("scripts/ci-restore.sh");
+  expect(pack != NULL, "can read scripts/ci-pack.sh");
+  expect(art != NULL, "can read scripts/ci-artifact.sh");
+  expect(restore != NULL, "can read scripts/ci-restore.sh");
+  expect(has_substr(pack, "/var/cache/apt/archives") && has_substr(pack, "/usr/local"), "ci-pack.sh packs apt debs and /usr/local");
+  expect(has_substr(art, "upload") && has_substr(art, "download") && has_substr(art, "ACTIONS_RUNTIME"),
+         "ci-artifact.sh talks to the Gitea artifact API");
+  expect(has_substr(restore, "ci-artifact.sh") && has_substr(restore, "dpkg"), "ci-restore.sh downloads and installs the packed tree");
 
   const char *all_jobs[] = {"prepare", "test", "sast", "vuln", "secrets", "fmt"};
   const char *check_jobs[] = {"test", "sast", "vuln", "secrets", "fmt"};
@@ -157,8 +158,13 @@ static void test_quality_gates(void) {
   char body[8192];
 
   copy_job_body(wf, "prepare", all_jobs, 6, body, sizeof(body));
-  expect(has_substr(body, "docker build"), "prepare builds a local job image");
-  expect(has_substr(body, ".gitea/ci.Dockerfile"), "prepare builds from the CI Dockerfile");
+  expect(has_substr(body, "apt-get install"), "prepare installs the shared toolchain");
+  expect(has_substr(body, "gcc") && has_substr(body, "make") && has_substr(body, "pkg-config") && has_substr(body, "libpq"),
+         "prepare installs gcc/make/pkg-config/libpq headers");
+  expect(has_substr(body, "cppcheck") && has_substr(body, "clang-format"), "prepare installs cppcheck and clang-format");
+  expect(has_substr(body, "gitleaks_8.30.1") && has_substr(body, "osv-scanner_linux_amd64"),
+         "prepare installs gitleaks v8.30.1 and osv-scanner v2.6.0");
+  expect(has_substr(body, "ci-pack.sh") && has_substr(body, "ci-artifact.sh upload"), "prepare publishes the packed toolchain");
   expect(!has_substr(body, "needs:"), "prepare does not wait on check jobs");
   expect(!has_substr(body, "make test") && !has_substr(body, "make sast") && !has_substr(body, "make vuln") &&
              !has_substr(body, "make secrets") && !has_substr(body, "make fmt-check"),
@@ -168,9 +174,7 @@ static void test_quality_gates(void) {
     copy_job_body(wf, check_jobs[i], all_jobs, 6, body, sizeof(body));
     expect(has_substr(body, "needs: prepare"), "check job waits on prepare");
     expect(count_substr(body, "needs:") == 1, "check job has a single prepare dependency");
-    expect(has_substr(body, "carolina-codes-c-ci:"), "check job uses the prepared image");
-    expect(has_substr(body, "docker run"), "check job docker-runs the prepared image");
-    expect(has_substr(body, "docker.io/library/docker:27-cli"), "check job uses a pullable docker CLI image");
+    expect(has_substr(body, "ci-restore.sh"), "check job restores the prepared environment");
     expect(has_substr(body, targets[i]), "check job runs its make target");
     int hits = 0;
     for (int t = 0; t < 5; t++) {
@@ -192,11 +196,16 @@ static void test_quality_gates(void) {
   expect(has_substr(body, "postgres://postgres:postgres@127.0.0.1:1/carolina_dev?connect_timeout=1"),
          "test job uses dead DATABASE_URL");
 
+  int art_rc = system("python3 scripts/test_ci_artifact.py");
+  expect(art_rc == 0, "ci-artifact.sh upload/download roundtrip against fake Gitea API");
+
   free(pre);
   free(wf);
   free(mk);
   free(sbom);
-  free(df);
+  free(pack);
+  free(art);
+  free(restore);
 }
 
 int main(void) {
