@@ -7,7 +7,18 @@ ifeq ($(strip $(LDLIBS)),)
 endif
 LDLIBS += -pthread
 
-.PHONY: all clean test
+export PATH := $(HOME)/.local/bin:$(HOME)/.local/share/mise/shims:$(PATH)
+
+SRC_C := src/main.c src/perf_test.c
+SRC_H := src/carolina.h
+SRC := $(SRC_C) $(SRC_H)
+
+GITLEAKS ?= gitleaks
+OSV_SCANNER ?= osv-scanner
+CPPCHECK ?= cppcheck
+CLANG_FORMAT ?= clang-format
+
+.PHONY: all clean test fmt fmt-check sast vuln secrets check hooks
 
 all: api
 
@@ -19,6 +30,31 @@ perf_test: src/main.c src/perf_test.c src/carolina.h
 
 test: perf_test
 	./perf_test
+
+fmt:
+	$(CLANG_FORMAT) -i $(SRC)
+
+fmt-check:
+	$(CLANG_FORMAT) --dry-run --Werror $(SRC)
+
+sast:
+	$(CPPCHECK) --std=c11 --enable=warning,performance,portability \
+		--error-exitcode=1 --inline-suppr \
+		--suppress=missingIncludeSystem --suppress=missingInclude \
+		--library=posix -U__has_include \
+		src
+
+vuln:
+	$(OSV_SCANNER) scan source --recursive --lockfile sbom.cdx.json .
+
+secrets:
+	$(GITLEAKS) detect --source . --verbose --redact
+
+check: test sast vuln secrets fmt-check
+
+hooks:
+	pre-commit install
+	git config core.hooksPath .githooks
 
 clean:
 	rm -f api perf_test

@@ -1,0 +1,115 @@
+# One Gitea Actions job per quality-gate check. Not a single combined job.
+# Jobs are independent so they run in parallel.
+#
+# Empty images: clone GITHUB_SHA with the job token over HTTPS.
+# Gitea git HTTP returns 401 without the token. Do not git init or set
+# init.defaultBranch here.
+name: precommit
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: precommit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates gcc make pkg-config libpq-dev libc6-dev
+      - run: |
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - run: make test
+
+  sast:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates cppcheck make
+      - run: |
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - run: make sast
+
+  vuln:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl make
+      - run: |
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - run: |
+          curl -fsSL -o /usr/local/bin/osv-scanner https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64
+          chmod +x /usr/local/bin/osv-scanner
+      - run: make vuln
+
+  secrets:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl tar make
+      - run: |
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz | tar -xz -C /usr/local/bin gitleaks
+      - run: make secrets
+
+  fmt:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates clang-format make
+      - run: |
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - run: make fmt-check

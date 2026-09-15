@@ -1,6 +1,6 @@
 # carolina-codes-c
 
-Read-only v1 polyglot API. See README.md for install, run, and test commands.
+Read-only v1 polyglot API. See README.md for install, run, and test commands. `make check` (and `make hooks` for pre-commit) runs tests, cppcheck, osv-scanner, gitleaks, and clang-format --dry-run.
 
 ## Cursor Cloud specific instructions
 

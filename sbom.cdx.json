@@ -1,0 +1,50 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "carolina-codes-c",
+      "version": "0.2.0"
+    },
+    "properties": [
+      {
+        "name": "source",
+        "value": "Dockerfile debian:bookworm-slim apt packages: libpq, ca-certificates, libc, libssl"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "libpq5",
+      "version": "15.19-0+deb12u1",
+      "purl": "pkg:deb/debian/libpq5@15.19-0%2Bdeb12u1?arch=amd64&distro=debian-12"
+    },
+    {
+      "type": "library",
+      "name": "libpq-dev",
+      "version": "15.19-0+deb12u1",
+      "purl": "pkg:deb/debian/libpq-dev@15.19-0%2Bdeb12u1?arch=amd64&distro=debian-12"
+    },
+    {
+      "type": "library",
+      "name": "ca-certificates",
+      "version": "20250419~deb12u1",
+      "purl": "pkg:deb/debian/ca-certificates@20250419~deb12u1?distro=debian-12"
+    },
+    {
+      "type": "library",
+      "name": "libc6",
+      "version": "2.36-9+deb12u14",
+      "purl": "pkg:deb/debian/libc6@2.36-9%2Bdeb12u14?arch=amd64&distro=debian-12"
+    },
+    {
+      "type": "library",
+      "name": "libssl3",
+      "version": "3.0.20-1~deb12u2",
+      "purl": "pkg:deb/debian/libssl3@3.0.20-1~deb12u2?arch=amd64&distro=debian-12"
+    }
+  ]
+}

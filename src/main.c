@@ -150,14 +150,15 @@ static void json_string(Buf *b, const char *v) {
   buf_puts(b, "\"");
   for (const unsigned char *p = (const unsigned char *)v; *p; ++p) {
     switch (*p) {
-      case '"': buf_puts(b, "\\\""); break;
-      case '\\': buf_puts(b, "\\\\"); break;
-      case '\n': buf_puts(b, "\\n"); break;
-      case '\r': buf_puts(b, "\\r"); break;
-      case '\t': buf_puts(b, "\\t"); break;
-      default:
-        if (*p < 0x20) buf_printf(b, "\\u%04x", *p);
-        else buf_append(b, (const char *)p, 1);
+    case '"': buf_puts(b, "\\\""); break;
+    case '\\': buf_puts(b, "\\\\"); break;
+    case '\n': buf_puts(b, "\\n"); break;
+    case '\r': buf_puts(b, "\\r"); break;
+    case '\t': buf_puts(b, "\\t"); break;
+    default:
+      if (*p < 0x20) buf_printf(b, "\\u%04x", *p);
+      else
+        buf_append(b, (const char *)p, 1);
     }
   }
   buf_puts(b, "\"");
@@ -1000,7 +1001,8 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
       Obj o;
       obj_begin(&o, &out->body);
       if (year_q && *year_q) year_sponsor_fields(&o, r, i);
-      else sponsor_fields(&o, r, i);
+      else
+        sponsor_fields(&o, r, i);
       obj_end(&o);
     }
     buf_puts(&out->body, "]");
@@ -1096,11 +1098,11 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
 
 static const char *status_text(int code) {
   switch (code) {
-    case 200: return "OK";
-    case 404: return "Not Found";
-    case 405: return "Method Not Allowed";
-    case 500: return "Internal Server Error";
-    default: return "OK";
+  case 200: return "OK";
+  case 404: return "Not Found";
+  case 405: return "Method Not Allowed";
+  case 500: return "Internal Server Error";
+  default: return "OK";
   }
 }
 
@@ -1214,7 +1216,8 @@ static void parse_origin(const char *url, char *host, size_t hsz, char *port, si
   snprintf(port, psz, "4000");
   const char *p = url;
   if (strncmp(p, "http://", 7) == 0) p += 7;
-  else if (strncmp(p, "https://", 8) == 0) p += 8;
+  else if (strncmp(p, "https://", 8) == 0)
+    p += 8;
   char tmp[256];
   snprintf(tmp, sizeof(tmp), "%s", p);
   char *slash = strchr(tmp, '/');
@@ -1241,7 +1244,8 @@ static void *register_thread(void *arg) {
   parse_origin(url, host, sizeof(host), port, sizeof(port));
   const char *pub = getenv("PUBLIC_BASE_URL");
   if (pub && *pub) snprintf(base, sizeof(base), "%s", pub);
-  else snprintf(base, sizeof(base), "http://127.0.0.1:%s", g_port);
+  else
+    snprintf(base, sizeof(base), "http://127.0.0.1:%s", g_port);
   Buf body;
   buf_init(&body);
   Obj o;
