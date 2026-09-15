@@ -169,6 +169,8 @@ static void test_quality_gates(void) {
     expect(has_substr(body, "needs: prepare"), "check job waits on prepare");
     expect(count_substr(body, "needs:") == 1, "check job has a single prepare dependency");
     expect(has_substr(body, "carolina-codes-c-ci:"), "check job uses the prepared image");
+    expect(has_substr(body, "docker run"), "check job docker-runs the prepared image");
+    expect(has_substr(body, "docker.io/library/docker:27-cli"), "check job uses a pullable docker CLI image");
     expect(has_substr(body, targets[i]), "check job runs its make target");
     int hits = 0;
     for (int t = 0; t < 5; t++) {

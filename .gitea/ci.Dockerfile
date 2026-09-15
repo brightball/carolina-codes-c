@@ -1,6 +1,7 @@
 # Shared Gitea Actions job image. Built once per run by the prepare job
-# on the runner's Docker daemon; check jobs use the local tag.
+# on the runner's Docker daemon; check jobs docker-run the local tag.
 FROM debian:bookworm-slim
+WORKDIR /src
 
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends \
