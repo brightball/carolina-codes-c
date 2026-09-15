@@ -3,8 +3,7 @@
 #
 # Empty images: clone GITHUB_SHA with the job token over HTTPS.
 # Gitea git HTTP returns 401 without the token. Do not git init or set
-# init.defaultBranch here. Clone and the check share one step so a
-# fallback workdir is visible to make.
+# init.defaultBranch here.
 name: precommit
 
 on:
@@ -18,7 +17,6 @@ concurrency:
 
 env:
   GITHUB_TOKEN: ${{ github.token }}
-  DEBIAN_FRONTEND: noninteractive
 
 jobs:
   test:
@@ -30,22 +28,14 @@ jobs:
     steps:
       - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates gcc make pkg-config libpq-dev libc6-dev
       - run: |
-          set -euo pipefail
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
           host="${GITHUB_SERVER_URL#https://}"
           host="${host#http://}"
-          git config --global --add safe.directory '*'
-          if [ -n "$(ls -A . 2>/dev/null || true)" ]; then
-            echo "workdir not empty, cloning into /tmp/repo" >&2
-            ls -la >&2
-            mkdir -p /tmp/repo
-            cd /tmp/repo
-          fi
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-          make test
+      - run: make test
 
   sast:
     runs-on: ubuntu-latest
@@ -56,22 +46,14 @@ jobs:
     steps:
       - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates cppcheck make
       - run: |
-          set -euo pipefail
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
           host="${GITHUB_SERVER_URL#https://}"
           host="${host#http://}"
-          git config --global --add safe.directory '*'
-          if [ -n "$(ls -A . 2>/dev/null || true)" ]; then
-            echo "workdir not empty, cloning into /tmp/repo" >&2
-            ls -la >&2
-            mkdir -p /tmp/repo
-            cd /tmp/repo
-          fi
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-          make sast
+      - run: make sast
 
   vuln:
     runs-on: ubuntu-latest
@@ -82,25 +64,17 @@ jobs:
     steps:
       - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl make
       - run: |
-          curl -fsSL -o /usr/local/bin/osv-scanner https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64
-          chmod +x /usr/local/bin/osv-scanner
-      - run: |
-          set -euo pipefail
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
           host="${GITHUB_SERVER_URL#https://}"
           host="${host#http://}"
-          git config --global --add safe.directory '*'
-          if [ -n "$(ls -A . 2>/dev/null || true)" ]; then
-            echo "workdir not empty, cloning into /tmp/repo" >&2
-            ls -la >&2
-            mkdir -p /tmp/repo
-            cd /tmp/repo
-          fi
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-          make vuln
+      - run: |
+          curl -fsSL -o /usr/local/bin/osv-scanner https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64
+          chmod +x /usr/local/bin/osv-scanner
+      - run: make vuln
 
   secrets:
     runs-on: ubuntu-latest
@@ -111,24 +85,16 @@ jobs:
     steps:
       - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl tar make
       - run: |
-          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz | tar -xz -C /usr/local/bin gitleaks
-      - run: |
-          set -euo pipefail
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
           host="${GITHUB_SERVER_URL#https://}"
           host="${host#http://}"
-          git config --global --add safe.directory '*'
-          if [ -n "$(ls -A . 2>/dev/null || true)" ]; then
-            echo "workdir not empty, cloning into /tmp/repo" >&2
-            ls -la >&2
-            mkdir -p /tmp/repo
-            cd /tmp/repo
-          fi
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-          make secrets
+      - run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz | tar -xz -C /usr/local/bin gitleaks
+      - run: make secrets
 
   fmt:
     runs-on: ubuntu-latest
@@ -139,19 +105,11 @@ jobs:
     steps:
       - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates clang-format make
       - run: |
-          set -euo pipefail
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
           host="${GITHUB_SERVER_URL#https://}"
           host="${host#http://}"
-          git config --global --add safe.directory '*'
-          if [ -n "$(ls -A . 2>/dev/null || true)" ]; then
-            echo "workdir not empty, cloning into /tmp/repo" >&2
-            ls -la >&2
-            mkdir -p /tmp/repo
-            cd /tmp/repo
-          fi
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-          make fmt-check
+      - run: make fmt-check
