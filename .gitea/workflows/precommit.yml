@@ -36,19 +36,7 @@ jobs:
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-      - run: |
-          set +e
-          make test > make-test.log 2>&1
-          status=$?
-          set -e
-          cat make-test.log
-          exit $status
-      - if: failure()
-        uses: actions/upload-artifact@v3
-        with:
-          name: make-test-log
-          path: make-test.log
-          if-no-files-found: ignore
+      - run: make test
 
   sast:
     runs-on: ubuntu-latest
