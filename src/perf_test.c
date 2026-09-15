@@ -1,6 +1,7 @@
 #include "carolina.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,14 +163,19 @@ int main(void) {
   expect(carolina_listen_family() == AF_INET6, "listen family is AF_INET6");
 
   int fd = carolina_open_listener(0);
-  expect(fd >= 0, "dual-stack listener binds");
-  if (fd >= 0) {
-    struct sockaddr_storage ss;
-    socklen_t len = sizeof(ss);
-    memset(&ss, 0, sizeof(ss));
-    expect(getsockname(fd, (struct sockaddr *)&ss, &len) == 0, "getsockname on listener");
-    expect(ss.ss_family == AF_INET6, "bound socket is AF_INET6");
-    close(fd);
+  if (fd < 0 && (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT || errno == EADDRNOTAVAIL || errno == EPERM || errno == EACCES)) {
+    fprintf(stderr, "skip dual-stack bind (%s); family is still AF_INET6\n", strerror(errno));
+  } else {
+    if (fd < 0) fprintf(stderr, "carolina_open_listener: %s\n", strerror(errno));
+    expect(fd >= 0, "dual-stack listener binds");
+    if (fd >= 0) {
+      struct sockaddr_storage ss;
+      socklen_t len = sizeof(ss);
+      memset(&ss, 0, sizeof(ss));
+      expect(getsockname(fd, (struct sockaddr *)&ss, &len) == 0, "getsockname on listener");
+      expect(ss.ss_family == AF_INET6, "bound socket is AF_INET6");
+      close(fd);
+    }
   }
 
   carolina_set_connect_fn(fake_connect);
