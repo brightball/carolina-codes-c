@@ -126,36 +126,75 @@ static void test_quality_gates(void) {
   expect(has_substr(mk, "sbom.cdx.json"), "Makefile vuln scans committed SBOM");
   expect(has_substr(sbom, "libpq5"), "SBOM lists libpq5 from Dockerfile");
 
+  expect(job_start(wf, "prepare") != NULL, "gitea job prepare");
   expect(job_start(wf, "test") != NULL, "gitea job test");
   expect(job_start(wf, "sast") != NULL, "gitea job sast");
   expect(job_start(wf, "vuln") != NULL, "gitea job vuln");
   expect(job_start(wf, "secrets") != NULL, "gitea job secrets");
   expect(job_start(wf, "fmt") != NULL, "gitea job fmt");
-  expect(count_substr(wf, "runs-on:") == 5, "exactly five gitea jobs");
-  expect(!has_substr(wf, "needs:"), "gitea check jobs are not chained");
-  expect(has_substr(wf, "gitleaks"), "gitea secrets job uses gitleaks");
+  expect(count_substr(wf, "runs-on:") == 6, "prepare plus five gitea check jobs");
+  expect(count_substr(wf, "needs: prepare") == 5, "five check jobs wait on prepare");
+  expect(count_substr(wf, "needs:") == 5, "check jobs are not chained to each other");
   expect(has_substr(wf, "make test"), "gitea test job runs make test");
   expect(has_substr(wf, "make sast"), "gitea sast job runs make sast");
   expect(has_substr(wf, "make vuln"), "gitea vuln job runs make vuln");
   expect(has_substr(wf, "make secrets"), "gitea secrets job runs make secrets");
   expect(has_substr(wf, "make fmt-check"), "gitea fmt job runs make fmt-check");
 
-  const char *jobs[] = {"test", "sast", "vuln", "secrets", "fmt"};
+  char *df = slurp(".gitea/ci.Dockerfile");
+  expect(df != NULL, "can read .gitea/ci.Dockerfile");
+  expect(has_substr(df, "        git \\") && has_substr(df, "ca-certificates"), "CI image installs git and ca-certificates");
+  expect(has_substr(df, "gcc") && has_substr(df, "make") && has_substr(df, "pkg-config") && has_substr(df, "libpq"),
+         "CI image installs gcc/make/pkg-config/libpq headers");
+  expect(has_substr(df, "cppcheck"), "CI image installs cppcheck");
+  expect(has_substr(df, "clang-format"), "CI image installs clang-format");
+  expect(has_substr(df, "gitleaks") && has_substr(df, "v8.30.1"), "CI image installs gitleaks v8.30.1");
+  expect(has_substr(df, "osv-scanner") && has_substr(df, "v2.6.0"), "CI image installs osv-scanner v2.6.0");
+
+  const char *all_jobs[] = {"prepare", "test", "sast", "vuln", "secrets", "fmt"};
+  const char *check_jobs[] = {"test", "sast", "vuln", "secrets", "fmt"};
   const char *targets[] = {"make test", "make sast", "make vuln", "make secrets", "make fmt-check"};
   char body[8192];
+
+  copy_job_body(wf, "prepare", all_jobs, 6, body, sizeof(body));
+  expect(has_substr(body, "docker build"), "prepare builds a local job image");
+  expect(has_substr(body, ".gitea/ci.Dockerfile"), "prepare builds from the CI Dockerfile");
+  expect(!has_substr(body, "needs:"), "prepare does not wait on check jobs");
+  expect(!has_substr(body, "make test") && !has_substr(body, "make sast") && !has_substr(body, "make vuln") &&
+             !has_substr(body, "make secrets") && !has_substr(body, "make fmt-check"),
+         "prepare does not run quality-check make targets");
+
   for (int i = 0; i < 5; i++) {
-    copy_job_body(wf, jobs[i], jobs, 5, body, sizeof(body));
+    copy_job_body(wf, check_jobs[i], all_jobs, 6, body, sizeof(body));
+    expect(has_substr(body, "needs: prepare"), "check job waits on prepare");
+    expect(count_substr(body, "needs:") == 1, "check job has a single prepare dependency");
+    expect(has_substr(body, "carolina-codes-c-ci:"), "check job uses the prepared image");
+    expect(has_substr(body, targets[i]), "check job runs its make target");
     int hits = 0;
     for (int t = 0; t < 5; t++) {
       if (has_substr(body, targets[t])) hits++;
     }
-    expect(hits < 5, "gitea job is not a combined all-checks job");
+    expect(hits == 1, "check job runs only its own make target");
+    expect(!has_substr(body, "apt-get install"), "check job does not apt-get install");
+    expect(!has_substr(body, "osv-scanner_linux_amd64"), "check job does not curl-install osv-scanner");
+    expect(!has_substr(body, "gitleaks_8.30.1"), "check job does not curl-install gitleaks");
+    for (int j = 0; j < 5; j++) {
+      if (j == i) continue;
+      char dep[64];
+      snprintf(dep, sizeof(dep), "needs: %s", check_jobs[j]);
+      expect(!has_substr(body, dep), "check jobs do not wait on each other");
+    }
   }
+
+  copy_job_body(wf, "test", all_jobs, 6, body, sizeof(body));
+  expect(has_substr(body, "postgres://postgres:postgres@127.0.0.1:1/carolina_dev?connect_timeout=1"),
+         "test job uses dead DATABASE_URL");
 
   free(pre);
   free(wf);
   free(mk);
   free(sbom);
+  free(df);
 }
 
 int main(void) {
