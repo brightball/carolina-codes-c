@@ -349,7 +349,7 @@ static CarolinaResult *talks_matching(const char *slug, const char *year) {
 
 static CarolinaResult *speaker_years(const char *slug) {
   const char *names[] = {"year"};
-  const char *cells[4];
+  const char *cells[4] = {"", "", "", ""};
   int n = 0;
   for (size_t i = 0; i < sizeof(kTalks) / sizeof(kTalks[0]); i++) {
     if (!slug || strcmp(kTalks[i].slug, slug) != 0) continue;
