@@ -28,6 +28,10 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+
+#include "carolina.h"
 
 static const char *kLanguage = "C";
 static const char *kApiVersion = "0.2.0";
@@ -76,9 +80,28 @@ static pthread_mutex_t g_db_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_db_cv = PTHREAD_COND_INITIALIZER;
 static PGconn *g_db_pool[DB_POOL_SIZE];
 static int g_db_busy[DB_POOL_SIZE];
+static int g_db_bad[DB_POOL_SIZE];
 static int g_sql_count;
 static int g_connect_count;
 static PGconn *(*g_connect_fn)(const char *) = NULL;
+static carolina_query_fn g_query_fn = NULL;
+static volatile sig_atomic_t g_serve_stop;
+
+/* Cap accepted-but-unfinished clients. A thread per connection would pin an
+ * 8MB stack each and OOM the 256MB Fly machine under slow clients. */
+#define MAX_INFLIGHT 64
+#define REQ_MAX 4096
+#define CONN_IDLE_MS 15000
+
+struct CarolinaResult {
+  int ok;
+  int conn_failed;
+  char *errmsg;
+  int nrows;
+  int ncols;
+  char **names;
+  char **cells;
+};
 
 static const char *env_or(const char *key, const char *fallback) {
   const char *v = getenv(key);
@@ -208,25 +231,167 @@ static void obj_raw(Obj *o, const char *k, const char *json) {
 
 static void obj_end(Obj *o) { buf_puts(o->b, "}"); }
 
-static const char *pgcol(PGresult *r, int row, const char *name) {
-  int i = PQfnumber(r, name);
-  if (i < 0 || PQgetisnull(r, row, i)) return NULL;
-  return PQgetvalue(r, row, i);
+static char *dup_text(const char *s) {
+  char *d = strdup(s ? s : "");
+  if (!d) abort();
+  return d;
+}
+
+static char *dup_nullable(const char *s) {
+  if (!s) return NULL;
+  char *d = strdup(s);
+  if (!d) abort();
+  return d;
+}
+
+static void carolina_result_free(CarolinaResult *r) {
+  if (!r) return;
+  free(r->errmsg);
+  if (r->names) {
+    for (int i = 0; i < r->ncols; i++) free(r->names[i]);
+    free(r->names);
+  }
+  if (r->cells) {
+    int n = r->nrows * r->ncols;
+    for (int i = 0; i < n; i++) free(r->cells[i]);
+    free(r->cells);
+  }
+  free(r);
+}
+
+CarolinaResult *carolina_result_fail(const char *error, int conn_failed) {
+  CarolinaResult *r = calloc(1, sizeof(*r));
+  if (!r) abort();
+  r->ok = 0;
+  r->conn_failed = conn_failed ? 1 : 0;
+  r->errmsg = dup_text(error && *error ? error : "query failed");
+  return r;
+}
+
+CarolinaResult *carolina_result_table(int nrows, int ncols, const char **names, const char **cells) {
+  CarolinaResult *r = calloc(1, sizeof(*r));
+  if (!r) abort();
+  r->ok = 1;
+  if (nrows < 0) nrows = 0;
+  if (ncols < 0) ncols = 0;
+  r->nrows = nrows;
+  r->ncols = ncols;
+  if (ncols > 0) {
+    r->names = calloc((size_t)ncols, sizeof(char *));
+    if (!r->names) abort();
+    for (int i = 0; i < ncols; i++) r->names[i] = dup_text(names ? names[i] : "");
+  }
+  int ncells = nrows * ncols;
+  if (ncells > 0) {
+    r->cells = calloc((size_t)ncells, sizeof(char *));
+    if (!r->cells) abort();
+    for (int i = 0; i < ncells; i++) {
+      const char *cell = cells ? cells[i] : NULL;
+      if (cell) r->cells[i] = dup_nullable(cell);
+    }
+  }
+  return r;
+}
+
+static const char *q_col(const CarolinaResult *r, int row, const char *name) {
+  if (!r || !r->ok || row < 0 || row >= r->nrows || !name) return NULL;
+  int col = -1;
+  for (int i = 0; i < r->ncols; i++) {
+    if (r->names && r->names[i] && strcmp(r->names[i], name) == 0) {
+      col = i;
+      break;
+    }
+  }
+  if (col < 0) return NULL;
+  return r->cells ? r->cells[row * r->ncols + col] : NULL;
 }
 
 static int truthy(const char *v) { return v && (v[0] == 't' || v[0] == 'T' || v[0] == '1'); }
 
 static int as_int(const char *v) { return v ? atoi(v) : 0; }
 
-static PGresult *exec_params(PGconn *c, const char *sql, int n, const char **vals) {
-  g_sql_count++;
-  return PQexecParams(c, sql, n, NULL, vals, NULL, NULL, 0);
+static int sqlstate_means_dead(const char *sqlstate) {
+  if (!sqlstate || sqlstate[0] == 0 || sqlstate[1] == 0) return 0;
+  if (sqlstate[0] == '0' && sqlstate[1] == '8') return 1;
+  if (strcmp(sqlstate, "57P01") == 0 || strcmp(sqlstate, "57P02") == 0 || strcmp(sqlstate, "57P03") == 0) return 1;
+  return 0;
 }
 
-static PGresult *db_exec(PGconn *c, const char *sql) {
-  g_sql_count++;
-  return PQexec(c, sql);
+static void db_mark_bad(PGconn *c) {
+  if (!c) return;
+  pthread_mutex_lock(&g_db_mu);
+  for (int i = 0; i < DB_POOL_SIZE; i++) {
+    if (g_db_pool[i] == c) g_db_bad[i] = 1;
+  }
+  pthread_mutex_unlock(&g_db_mu);
 }
+
+static void discard_pg(struct pg_result *pr) {
+  if (pr) PQclear(pr);
+}
+
+static CarolinaResult *result_from_pg(PGconn *c, struct pg_result *pr) {
+  if (!pr) {
+    const char *msg = c ? PQerrorMessage(c) : NULL;
+    CarolinaResult *r = carolina_result_fail(msg, 1);
+    db_mark_bad(c);
+    return r;
+  }
+  ExecStatusType st = PQresultStatus(pr);
+  if (st == PGRES_TUPLES_OK || st == PGRES_COMMAND_OK) {
+    int nrows = PQntuples(pr);
+    int ncols = PQnfields(pr);
+    const char **names = NULL;
+    const char **cells = NULL;
+    if (ncols > 0) {
+      names = calloc((size_t)ncols, sizeof(char *));
+      if (!names) abort();
+      for (int i = 0; i < ncols; i++) names[i] = PQfname(pr, i);
+    }
+    int ncells = nrows * ncols;
+    if (ncells > 0) {
+      cells = calloc((size_t)ncells, sizeof(char *));
+      if (!cells) abort();
+      for (int row = 0; row < nrows; row++) {
+        for (int col = 0; col < ncols; col++) {
+          if (PQgetisnull(pr, row, col)) continue;
+          cells[row * ncols + col] = PQgetvalue(pr, row, col);
+        }
+      }
+    }
+    CarolinaResult *r = carolina_result_table(nrows, ncols, names, cells);
+    free(names);
+    free(cells);
+    discard_pg(pr);
+    return r;
+  }
+  const char *msg = PQresultErrorMessage(pr);
+  const char *sqlstate = PQresultErrorField(pr, PG_DIAG_SQLSTATE);
+  int dead = (c && !g_connect_fn && PQstatus(c) != CONNECTION_OK) || sqlstate_means_dead(sqlstate);
+  CarolinaResult *r = carolina_result_fail(msg, dead);
+  if (dead) db_mark_bad(c);
+  discard_pg(pr);
+  return r;
+}
+
+static CarolinaResult *run_query(PGconn *c, const char *sql, int nparams, const char **vals, int with_params) {
+  g_sql_count++;
+  if (g_query_fn) {
+    CarolinaResult *r = g_query_fn(c, sql, with_params ? nparams : 0, with_params ? (const char *const *)vals : NULL);
+    if (!r) r = carolina_result_fail("query failed", 1);
+    if (r->conn_failed) db_mark_bad(c);
+    return r;
+  }
+  struct pg_result *pr =
+      with_params ? PQexecParams(c, sql, nparams, NULL, vals, NULL, NULL, 0) : PQexec(c, sql);
+  return result_from_pg(c, pr);
+}
+
+static CarolinaResult *exec_params(PGconn *c, const char *sql, int n, const char **vals) {
+  return run_query(c, sql, n, vals, 1);
+}
+
+static CarolinaResult *db_exec(PGconn *c, const char *sql) { return run_query(c, sql, 0, NULL, 0); }
 
 static int conn_ok(PGconn *c) {
   if (!c) return 0;
@@ -269,11 +434,21 @@ static PGconn *db_acquire(void) {
   }
 }
 
+static int real_conn_dead(PGconn *c) {
+  if (!c || g_connect_fn) return 0;
+  return PQstatus(c) != CONNECTION_OK;
+}
+
 static void db_release(PGconn *c) {
   if (!c) return;
   pthread_mutex_lock(&g_db_mu);
   for (int i = 0; i < DB_POOL_SIZE; i++) {
     if (g_db_pool[i] == c) {
+      if (g_db_bad[i] || real_conn_dead(c)) {
+        if (!g_connect_fn) PQfinish(c);
+        g_db_pool[i] = NULL;
+        g_db_bad[i] = 0;
+      }
       g_db_busy[i] = 0;
       break;
     }
@@ -282,57 +457,53 @@ static void db_release(PGconn *c) {
   pthread_mutex_unlock(&g_db_mu);
 }
 
-static int res_ok(PGresult *r) {
-  if (!r) return 0;
-  ExecStatusType s = PQresultStatus(r);
-  return s == PGRES_TUPLES_OK || s == PGRES_COMMAND_OK;
+static int res_ok(const CarolinaResult *r) { return r && r->ok; }
+
+static void speaker_fields(Obj *o, CarolinaResult *r, int row) {
+  obj_str(o, "slug", q_col(r, row, "slug"));
+  obj_str(o, "first_name", q_col(r, row, "first_name"));
+  obj_str(o, "last_name", q_col(r, row, "last_name"));
+  obj_str(o, "name", q_col(r, row, "name"));
+  obj_str(o, "tagline", q_col(r, row, "tagline"));
+  obj_str(o, "bio", q_col(r, row, "bio"));
+  obj_str(o, "company", q_col(r, row, "company"));
+  obj_str(o, "location", q_col(r, row, "location"));
+  obj_str(o, "photo_path", q_col(r, row, "photo_path"));
+  obj_str(o, "twitter_url", q_col(r, row, "twitter_url"));
+  obj_str(o, "linkedin_url", q_col(r, row, "linkedin_url"));
+  obj_str(o, "website_url", q_col(r, row, "website_url"));
+  obj_str(o, "github_url", q_col(r, row, "github_url"));
+  obj_bool(o, "featured", truthy(q_col(r, row, "featured")));
 }
 
-static void speaker_fields(Obj *o, PGresult *r, int row) {
-  obj_str(o, "slug", pgcol(r, row, "slug"));
-  obj_str(o, "first_name", pgcol(r, row, "first_name"));
-  obj_str(o, "last_name", pgcol(r, row, "last_name"));
-  obj_str(o, "name", pgcol(r, row, "name"));
-  obj_str(o, "tagline", pgcol(r, row, "tagline"));
-  obj_str(o, "bio", pgcol(r, row, "bio"));
-  obj_str(o, "company", pgcol(r, row, "company"));
-  obj_str(o, "location", pgcol(r, row, "location"));
-  obj_str(o, "photo_path", pgcol(r, row, "photo_path"));
-  obj_str(o, "twitter_url", pgcol(r, row, "twitter_url"));
-  obj_str(o, "linkedin_url", pgcol(r, row, "linkedin_url"));
-  obj_str(o, "website_url", pgcol(r, row, "website_url"));
-  obj_str(o, "github_url", pgcol(r, row, "github_url"));
-  obj_bool(o, "featured", truthy(pgcol(r, row, "featured")));
+static void year_sponsor_fields(Obj *o, CarolinaResult *r, int row) {
+  obj_str(o, "slug", q_col(r, row, "slug"));
+  obj_str(o, "name", q_col(r, row, "name"));
+  obj_str(o, "website", q_col(r, row, "website"));
+  obj_str(o, "logo_path", q_col(r, row, "logo_path"));
+  obj_str(o, "description", q_col(r, row, "description"));
+  obj_str(o, "blurb", q_col(r, row, "blurb"));
+  obj_str(o, "tier", q_col(r, row, "tier"));
+  obj_bool(o, "featured", truthy(q_col(r, row, "featured")));
+  obj_int(o, "year", as_int(q_col(r, row, "year")));
+  obj_str(o, "twitter_url", q_col(r, row, "twitter_url"));
+  obj_str(o, "linkedin_url", q_col(r, row, "linkedin_url"));
+  obj_str(o, "youtube_url", q_col(r, row, "youtube_url"));
+  obj_str(o, "instagram_url", q_col(r, row, "instagram_url"));
+  obj_str(o, "facebook_url", q_col(r, row, "facebook_url"));
 }
 
-static void year_sponsor_fields(Obj *o, PGresult *r, int row) {
-  obj_str(o, "slug", pgcol(r, row, "slug"));
-  obj_str(o, "name", pgcol(r, row, "name"));
-  obj_str(o, "website", pgcol(r, row, "website"));
-  obj_str(o, "logo_path", pgcol(r, row, "logo_path"));
-  obj_str(o, "description", pgcol(r, row, "description"));
-  obj_str(o, "blurb", pgcol(r, row, "blurb"));
-  obj_str(o, "tier", pgcol(r, row, "tier"));
-  obj_bool(o, "featured", truthy(pgcol(r, row, "featured")));
-  obj_int(o, "year", as_int(pgcol(r, row, "year")));
-  obj_str(o, "twitter_url", pgcol(r, row, "twitter_url"));
-  obj_str(o, "linkedin_url", pgcol(r, row, "linkedin_url"));
-  obj_str(o, "youtube_url", pgcol(r, row, "youtube_url"));
-  obj_str(o, "instagram_url", pgcol(r, row, "instagram_url"));
-  obj_str(o, "facebook_url", pgcol(r, row, "facebook_url"));
-}
-
-static void sponsor_fields(Obj *o, PGresult *r, int row) {
-  obj_str(o, "slug", pgcol(r, row, "slug"));
-  obj_str(o, "name", pgcol(r, row, "name"));
-  obj_str(o, "website", pgcol(r, row, "website"));
-  obj_str(o, "logo_path", pgcol(r, row, "logo_path"));
-  obj_str(o, "description", pgcol(r, row, "description"));
-  obj_str(o, "twitter_url", pgcol(r, row, "twitter_url"));
-  obj_str(o, "linkedin_url", pgcol(r, row, "linkedin_url"));
-  obj_str(o, "youtube_url", pgcol(r, row, "youtube_url"));
-  obj_str(o, "instagram_url", pgcol(r, row, "instagram_url"));
-  obj_str(o, "facebook_url", pgcol(r, row, "facebook_url"));
+static void sponsor_fields(Obj *o, CarolinaResult *r, int row) {
+  obj_str(o, "slug", q_col(r, row, "slug"));
+  obj_str(o, "name", q_col(r, row, "name"));
+  obj_str(o, "website", q_col(r, row, "website"));
+  obj_str(o, "logo_path", q_col(r, row, "logo_path"));
+  obj_str(o, "description", q_col(r, row, "description"));
+  obj_str(o, "twitter_url", q_col(r, row, "twitter_url"));
+  obj_str(o, "linkedin_url", q_col(r, row, "linkedin_url"));
+  obj_str(o, "youtube_url", q_col(r, row, "youtube_url"));
+  obj_str(o, "instagram_url", q_col(r, row, "instagram_url"));
+  obj_str(o, "facebook_url", q_col(r, row, "facebook_url"));
 }
 
 static void json_str_array_from_pgjson(Buf *b, const char *raw) {
@@ -403,68 +574,60 @@ static void talks_json(PGconn *c, const char *slug, const char *year, Buf *out, 
     vals[1] = year;
     nparams = 2;
   }
-  PGresult *r = exec_params(c, sql, nparams, vals);
+  CarolinaResult *r = exec_params(c, sql, nparams, vals);
   buf_puts(out, "[");
   *ntalks = 0;
   int nlang = 0, ntop = 0;
   if (res_ok(r)) {
-    for (int i = 0; i < PQntuples(r); i++) {
+    for (int i = 0; i < r->nrows; i++) {
       if (*ntalks) buf_puts(out, ",");
       Obj o;
       obj_begin(&o, out);
-      obj_str(&o, "slug", pgcol(r, i, "slug"));
-      obj_str(&o, "title", pgcol(r, i, "title"));
-      obj_str(&o, "description", pgcol(r, i, "description"));
-      obj_str(&o, "format", pgcol(r, i, "format"));
-      obj_str(&o, "youtube_id", pgcol(r, i, "youtube_id"));
-      obj_int(&o, "year", as_int(pgcol(r, i, "year")));
-      obj_str(&o, "speaker_slug", pgcol(r, i, "speaker_slug"));
+      obj_str(&o, "slug", q_col(r, i, "slug"));
+      obj_str(&o, "title", q_col(r, i, "title"));
+      obj_str(&o, "description", q_col(r, i, "description"));
+      obj_str(&o, "format", q_col(r, i, "format"));
+      obj_str(&o, "youtube_id", q_col(r, i, "youtube_id"));
+      obj_int(&o, "year", as_int(q_col(r, i, "year")));
+      obj_str(&o, "speaker_slug", q_col(r, i, "speaker_slug"));
       obj_key(&o, "languages");
-      json_str_array_from_pgjson(out, pgcol(r, i, "languages"));
+      json_str_array_from_pgjson(out, q_col(r, i, "languages"));
       obj_key(&o, "topics");
-      json_str_array_from_pgjson(out, pgcol(r, i, "topics"));
+      json_str_array_from_pgjson(out, q_col(r, i, "topics"));
       obj_end(&o);
-      collect_from_json_array(pgcol(r, i, "languages"), langs, &nlang);
-      collect_from_json_array(pgcol(r, i, "topics"), topics, &ntop);
+      collect_from_json_array(q_col(r, i, "languages"), langs, &nlang);
+      collect_from_json_array(q_col(r, i, "topics"), topics, &ntop);
       (*ntalks)++;
     }
   }
   buf_puts(out, "]");
-  if (r) PQclear(r);
+  if (r) carolina_result_free(r);
 }
 
-static void years_json(PGconn *c, const char *sql, const char *slug, Buf *out) {
+/* One round trip fills both year arrays. other may be NULL. */
+static void year_lists(PGconn *c, const char *sql, const char *slug, int skip_year, int have_skip, Buf *years,
+                       Buf *other) {
   const char *vals[1] = {slug};
-  PGresult *r = exec_params(c, sql, 1, vals);
-  buf_puts(out, "[");
-  int n = 0;
+  CarolinaResult *r = exec_params(c, sql, 1, vals);
+  buf_puts(years, "[");
+  if (other) buf_puts(other, "[");
+  int ny = 0, no = 0;
   if (res_ok(r)) {
-    for (int i = 0; i < PQntuples(r); i++) {
-      if (n) buf_puts(out, ",");
-      buf_printf(out, "%d", as_int(pgcol(r, i, "year")));
-      n++;
+    for (int i = 0; i < r->nrows; i++) {
+      int y = as_int(q_col(r, i, "year"));
+      if (ny) buf_puts(years, ",");
+      buf_printf(years, "%d", y);
+      ny++;
+      if (other && (!have_skip || y != skip_year)) {
+        if (no) buf_puts(other, ",");
+        buf_printf(other, "%d", y);
+        no++;
+      }
     }
   }
-  buf_puts(out, "]");
-  if (r) PQclear(r);
-}
-
-static void other_years_json(PGconn *c, const char *sql, const char *slug, int year, Buf *out) {
-  const char *vals[1] = {slug};
-  PGresult *r = exec_params(c, sql, 1, vals);
-  buf_puts(out, "[");
-  int n = 0;
-  if (res_ok(r)) {
-    for (int i = 0; i < PQntuples(r); i++) {
-      int y = as_int(pgcol(r, i, "year"));
-      if (y == year) continue;
-      if (n) buf_puts(out, ",");
-      buf_printf(out, "%d", y);
-      n++;
-    }
-  }
-  buf_puts(out, "]");
-  if (r) PQclear(r);
+  buf_puts(years, "]");
+  if (other) buf_puts(other, "]");
+  carolina_result_free(r);
 }
 
 typedef struct {
@@ -475,20 +638,20 @@ typedef struct {
   int ntalks, nlang, ntop, nyears;
 } YearExtras;
 
-static int speaker_row_for_slug(PGresult *speakers, const char *slug) {
+static int speaker_row_for_slug(CarolinaResult *speakers, const char *slug) {
   if (!slug) return -1;
-  for (int i = 0; i < PQntuples(speakers); i++) {
-    const char *s = pgcol(speakers, i, "slug");
+  for (int i = 0; i < speakers->nrows; i++) {
+    const char *s = q_col(speakers, i, "slug");
     if (s && strcmp(s, slug) == 0) return i;
   }
   return -1;
 }
 
-static void pg_slug_array(PGresult *speakers, Buf *out) {
+static void pg_slug_array(CarolinaResult *speakers, Buf *out) {
   buf_puts(out, "{");
   int n = 0;
-  for (int i = 0; i < PQntuples(speakers); i++) {
-    const char *slug = pgcol(speakers, i, "slug");
+  for (int i = 0; i < speakers->nrows; i++) {
+    const char *slug = q_col(speakers, i, "slug");
     if (!slug || !*slug) continue;
     if (n) buf_puts(out, ",");
     buf_puts(out, "\"");
@@ -499,67 +662,67 @@ static void pg_slug_array(PGresult *speakers, Buf *out) {
   buf_puts(out, "}");
 }
 
-static void load_year_extras(PGconn *c, const char *ybuf, PGresult *speakers, YearExtras *ex) {
-  int n = PQntuples(speakers);
+static void load_year_extras(PGconn *c, const char *ybuf, CarolinaResult *speakers, YearExtras *ex) {
+  int n = speakers->nrows;
   if (n <= 0) return;
 
   char talks_sql[1024];
   snprintf(talks_sql, sizeof(talks_sql),
            "SELECT %s FROM v1_talks WHERE year = $1 ORDER BY speaker_slug, year DESC", kTalkSelect);
   const char *tvals[1] = {ybuf};
-  PGresult *talks = exec_params(c, talks_sql, 1, tvals);
+  CarolinaResult *talks = exec_params(c, talks_sql, 1, tvals);
   if (res_ok(talks)) {
-    for (int i = 0; i < PQntuples(talks); i++) {
-      int row = speaker_row_for_slug(speakers, pgcol(talks, i, "speaker_slug"));
+    for (int i = 0; i < talks->nrows; i++) {
+      int row = speaker_row_for_slug(speakers, q_col(talks, i, "speaker_slug"));
       if (row < 0) continue;
       YearExtras *e = &ex[row];
       if (e->ntalks) buf_puts(&e->talks, ",");
       Obj o;
       obj_begin(&o, &e->talks);
-      obj_str(&o, "slug", pgcol(talks, i, "slug"));
-      obj_str(&o, "title", pgcol(talks, i, "title"));
-      obj_str(&o, "description", pgcol(talks, i, "description"));
-      obj_str(&o, "format", pgcol(talks, i, "format"));
-      obj_str(&o, "youtube_id", pgcol(talks, i, "youtube_id"));
-      obj_int(&o, "year", as_int(pgcol(talks, i, "year")));
-      obj_str(&o, "speaker_slug", pgcol(talks, i, "speaker_slug"));
+      obj_str(&o, "slug", q_col(talks, i, "slug"));
+      obj_str(&o, "title", q_col(talks, i, "title"));
+      obj_str(&o, "description", q_col(talks, i, "description"));
+      obj_str(&o, "format", q_col(talks, i, "format"));
+      obj_str(&o, "youtube_id", q_col(talks, i, "youtube_id"));
+      obj_int(&o, "year", as_int(q_col(talks, i, "year")));
+      obj_str(&o, "speaker_slug", q_col(talks, i, "speaker_slug"));
       obj_key(&o, "languages");
-      json_str_array_from_pgjson(&e->talks, pgcol(talks, i, "languages"));
+      json_str_array_from_pgjson(&e->talks, q_col(talks, i, "languages"));
       obj_key(&o, "topics");
-      json_str_array_from_pgjson(&e->talks, pgcol(talks, i, "topics"));
+      json_str_array_from_pgjson(&e->talks, q_col(talks, i, "topics"));
       obj_end(&o);
-      collect_from_json_array(pgcol(talks, i, "languages"), &e->langs, &e->nlang);
-      collect_from_json_array(pgcol(talks, i, "topics"), &e->topics, &e->ntop);
+      collect_from_json_array(q_col(talks, i, "languages"), &e->langs, &e->nlang);
+      collect_from_json_array(q_col(talks, i, "topics"), &e->topics, &e->ntop);
       e->ntalks++;
     }
   }
-  if (talks) PQclear(talks);
+  if (talks) carolina_result_free(talks);
 
   Buf slugs;
   buf_init(&slugs);
   pg_slug_array(speakers, &slugs);
   const char *yvals[1] = {slugs.s};
-  PGresult *yrs = exec_params(
+  CarolinaResult *yrs = exec_params(
       c,
       "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY($1::text[]) "
       "ORDER BY speaker_slug, year DESC",
       1, yvals);
   if (res_ok(yrs)) {
-    for (int i = 0; i < PQntuples(yrs); i++) {
-      int row = speaker_row_for_slug(speakers, pgcol(yrs, i, "speaker_slug"));
+    for (int i = 0; i < yrs->nrows; i++) {
+      int row = speaker_row_for_slug(speakers, q_col(yrs, i, "speaker_slug"));
       if (row < 0) continue;
       YearExtras *e = &ex[row];
       if (e->nyears) buf_puts(&e->years, ",");
-      buf_printf(&e->years, "%d", as_int(pgcol(yrs, i, "year")));
+      buf_printf(&e->years, "%d", as_int(q_col(yrs, i, "year")));
       e->nyears++;
     }
   }
-  if (yrs) PQclear(yrs);
+  if (yrs) carolina_result_free(yrs);
   buf_free(&slugs);
 }
 
-static void write_year_speaker_list(PGconn *c, const char *ybuf, PGresult *speakers, Buf *body) {
-  int n = PQntuples(speakers);
+static void write_year_speaker_list(PGconn *c, const char *ybuf, CarolinaResult *speakers, Buf *body) {
+  int n = speakers->nrows;
   YearExtras *ex = calloc((size_t)(n > 0 ? n : 1), sizeof(*ex));
   if (!ex) abort();
   for (int i = 0; i < n; i++) {
@@ -615,28 +778,28 @@ static void write_year_speaker_list(PGconn *c, const char *ybuf, PGresult *speak
 
 static void sponsorships_json(PGconn *c, const char *slug, Buf *out) {
   const char *vals[1] = {slug};
-  PGresult *r = exec_params(c,
-                            "SELECT sponsor_slug, year, tier, blurb, featured FROM v1_sponsorships "
-                            "WHERE sponsor_slug = $1 ORDER BY year DESC",
-                            1, vals);
+  CarolinaResult *r = exec_params(c,
+                                  "SELECT sponsor_slug, year, tier, blurb, featured FROM v1_sponsorships "
+                                  "WHERE sponsor_slug = $1 ORDER BY year DESC",
+                                  1, vals);
   buf_puts(out, "[");
   int n = 0;
   if (res_ok(r)) {
-    for (int i = 0; i < PQntuples(r); i++) {
+    for (int i = 0; i < r->nrows; i++) {
       if (n) buf_puts(out, ",");
       Obj o;
       obj_begin(&o, out);
-      obj_str(&o, "sponsor_slug", pgcol(r, i, "sponsor_slug"));
-      obj_int(&o, "year", as_int(pgcol(r, i, "year")));
-      obj_str(&o, "tier", pgcol(r, i, "tier"));
-      obj_str(&o, "blurb", pgcol(r, i, "blurb"));
-      obj_bool(&o, "featured", truthy(pgcol(r, i, "featured")));
+      obj_str(&o, "sponsor_slug", q_col(r, i, "sponsor_slug"));
+      obj_int(&o, "year", as_int(q_col(r, i, "year")));
+      obj_str(&o, "tier", q_col(r, i, "tier"));
+      obj_str(&o, "blurb", q_col(r, i, "blurb"));
+      obj_bool(&o, "featured", truthy(q_col(r, i, "featured")));
       obj_end(&o);
       n++;
     }
   }
   buf_puts(out, "]");
-  if (r) PQclear(r);
+  if (r) carolina_result_free(r);
 }
 
 static void identity_json(Buf *b) {
@@ -730,13 +893,13 @@ static void connect_failed(Reply *out) {
   obj_end(&o);
 }
 
-static void fail_sql(Reply *out, PGresult *r) {
+static void fail_sql(Reply *out, CarolinaResult *r) {
   out->status = 500;
   buf_free(&out->body);
   buf_init(&out->body);
   Obj o;
   obj_begin(&o, &out->body);
-  obj_str(&o, "error", r ? PQresultErrorMessage(r) : "query failed");
+  obj_str(&o, "error", (r && r->errmsg && r->errmsg[0]) ? r->errmsg : "query failed");
   obj_end(&o);
 }
 
@@ -775,10 +938,10 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
   }
 
   if (nparts == 2 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "years") == 0) {
-    PGresult *r = db_exec(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC");
+    CarolinaResult *r = db_exec(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC");
     if (!res_ok(r)) {
       fail_sql(out, r);
-      if (r) PQclear(r);
+      if (r) carolina_result_free(r);
       db_release(c);
       return;
     }
@@ -786,25 +949,25 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     obj_begin(&root, &out->body);
     obj_key(&root, "data");
     buf_puts(&out->body, "[");
-    for (int i = 0; i < PQntuples(r); i++) {
+    for (int i = 0; i < r->nrows; i++) {
       if (i) buf_puts(&out->body, ",");
       Obj o;
       obj_begin(&o, &out->body);
-      obj_int(&o, "year", as_int(pgcol(r, i, "year")));
-      obj_str(&o, "slug", pgcol(r, i, "slug"));
-      obj_str(&o, "name", pgcol(r, i, "name"));
-      obj_str(&o, "status", pgcol(r, i, "status"));
+      obj_int(&o, "year", as_int(q_col(r, i, "year")));
+      obj_str(&o, "slug", q_col(r, i, "slug"));
+      obj_str(&o, "name", q_col(r, i, "name"));
+      obj_str(&o, "status", q_col(r, i, "status"));
       obj_end(&o);
     }
     buf_puts(&out->body, "]");
     obj_end(&root);
-    PQclear(r);
+    carolina_result_free(r);
     db_release(c);
     return;
   }
 
   if (nparts == 2 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "speakers") == 0) {
-    PGresult *r;
+    CarolinaResult *r;
     char ybuf[16] = {0};
     if (year_q && *year_q) {
       snprintf(ybuf, sizeof(ybuf), "%d", atoi(year_q));
@@ -822,13 +985,13 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     }
     if (!res_ok(r)) {
       fail_sql(out, r);
-      if (r) PQclear(r);
+      if (r) carolina_result_free(r);
       db_release(c);
       return;
     }
     if (year_q && *year_q) {
       write_year_speaker_list(c, ybuf, r, &out->body);
-      PQclear(r);
+      carolina_result_free(r);
       db_release(c);
       return;
     }
@@ -836,7 +999,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     obj_begin(&root, &out->body);
     obj_key(&root, "data");
     buf_puts(&out->body, "[");
-    for (int i = 0; i < PQntuples(r); i++) {
+    for (int i = 0; i < r->nrows; i++) {
       if (i) buf_puts(&out->body, ",");
       Obj o;
       obj_begin(&o, &out->body);
@@ -845,7 +1008,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     }
     buf_puts(&out->body, "]");
     obj_end(&root);
-    PQclear(r);
+    carolina_result_free(r);
     db_release(c);
     return;
   }
@@ -857,15 +1020,15 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     char sql[1024];
     snprintf(sql, sizeof(sql), "SELECT %s FROM v1_speakers WHERE slug = $1", kSpeakerCols);
     const char *vals[1] = {slug};
-    PGresult *r = exec_params(c, sql, 1, vals);
+    CarolinaResult *r = exec_params(c, sql, 1, vals);
     if (!res_ok(r)) {
       fail_sql(out, r);
-      if (r) PQclear(r);
+      if (r) carolina_result_free(r);
       db_release(c);
       return;
     }
-    if (PQntuples(r) == 0) {
-      PQclear(r);
+    if (r->nrows == 0) {
+      carolina_result_free(r);
       db_release(c);
       not_found(out);
       return;
@@ -884,14 +1047,13 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
       buf_free(&topics);
       buf_free(&years);
       buf_free(&other);
-      PQclear(r);
+      carolina_result_free(r);
       db_release(c);
       not_found(out);
       return;
     }
-    years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug, &years);
-    other_years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug,
-                     atoi(ybuf), &other);
+    year_lists(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug, atoi(ybuf), 1,
+               &years, &other);
     Buf langarr, toparr;
     buf_init(&langarr);
     buf_init(&toparr);
@@ -922,7 +1084,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_free(&other);
     buf_free(&langarr);
     buf_free(&toparr);
-    PQclear(r);
+    carolina_result_free(r);
     db_release(c);
     return;
   }
@@ -932,15 +1094,15 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     char sql[1024];
     snprintf(sql, sizeof(sql), "SELECT %s FROM v1_speakers WHERE slug = $1", kSpeakerCols);
     const char *vals[1] = {slug};
-    PGresult *r = exec_params(c, sql, 1, vals);
+    CarolinaResult *r = exec_params(c, sql, 1, vals);
     if (!res_ok(r)) {
       fail_sql(out, r);
-      if (r) PQclear(r);
+      if (r) carolina_result_free(r);
       db_release(c);
       return;
     }
-    if (PQntuples(r) == 0) {
-      PQclear(r);
+    if (r->nrows == 0) {
+      carolina_result_free(r);
       db_release(c);
       not_found(out);
       return;
@@ -952,7 +1114,8 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_init(&years);
     int nt = 0;
     talks_json(c, slug, NULL, &talks, &langs, &topics, &nt);
-    years_json(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug, &years);
+    year_lists(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC", slug, 0, 0, &years,
+               NULL);
     Obj root;
     obj_begin(&root, &out->body);
     obj_key(&root, "data");
@@ -967,13 +1130,13 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     buf_free(&langs);
     buf_free(&topics);
     buf_free(&years);
-    PQclear(r);
+    carolina_result_free(r);
     db_release(c);
     return;
   }
 
   if (nparts == 2 && strcmp(parts[0], "v1") == 0 && strcmp(parts[1], "sponsors") == 0) {
-    PGresult *r;
+    CarolinaResult *r;
     if (year_q && *year_q) {
       char ybuf[16];
       snprintf(ybuf, sizeof(ybuf), "%d", atoi(year_q));
@@ -988,7 +1151,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     }
     if (!res_ok(r)) {
       fail_sql(out, r);
-      if (r) PQclear(r);
+      if (r) carolina_result_free(r);
       db_release(c);
       return;
     }
@@ -996,7 +1159,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     obj_begin(&root, &out->body);
     obj_key(&root, "data");
     buf_puts(&out->body, "[");
-    for (int i = 0; i < PQntuples(r); i++) {
+    for (int i = 0; i < r->nrows; i++) {
       if (i) buf_puts(&out->body, ",");
       Obj o;
       obj_begin(&o, &out->body);
@@ -1007,7 +1170,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     }
     buf_puts(&out->body, "]");
     obj_end(&root);
-    PQclear(r);
+    carolina_result_free(r);
     db_release(c);
     return;
   }
@@ -1019,15 +1182,15 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     char sql[1024];
     snprintf(sql, sizeof(sql), "SELECT %s FROM v1_year_sponsors WHERE year = $1 AND slug = $2", kYearSponsorCols);
     const char *vals[2] = {ybuf, slug};
-    PGresult *r = exec_params(c, sql, 2, vals);
+    CarolinaResult *r = exec_params(c, sql, 2, vals);
     if (!res_ok(r)) {
       fail_sql(out, r);
-      if (r) PQclear(r);
+      if (r) carolina_result_free(r);
       db_release(c);
       return;
     }
-    if (PQntuples(r) == 0) {
-      PQclear(r);
+    if (r->nrows == 0) {
+      carolina_result_free(r);
       db_release(c);
       not_found(out);
       return;
@@ -1035,10 +1198,8 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     Buf years, other;
     buf_init(&years);
     buf_init(&other);
-    years_json(c, "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC", slug,
-               &years);
-    other_years_json(c, "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC", slug,
-                     atoi(ybuf), &other);
+    year_lists(c, "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC", slug,
+               atoi(ybuf), 1, &years, &other);
     Obj root;
     obj_begin(&root, &out->body);
     obj_key(&root, "data");
@@ -1051,7 +1212,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     obj_end(&root);
     buf_free(&years);
     buf_free(&other);
-    PQclear(r);
+    carolina_result_free(r);
     db_release(c);
     return;
   }
@@ -1061,15 +1222,15 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     char sql[1024];
     snprintf(sql, sizeof(sql), "SELECT %s FROM v1_sponsors WHERE slug = $1", kSponsorCols);
     const char *vals[1] = {slug};
-    PGresult *r = exec_params(c, sql, 1, vals);
+    CarolinaResult *r = exec_params(c, sql, 1, vals);
     if (!res_ok(r)) {
       fail_sql(out, r);
-      if (r) PQclear(r);
+      if (r) carolina_result_free(r);
       db_release(c);
       return;
     }
-    if (PQntuples(r) == 0) {
-      PQclear(r);
+    if (r->nrows == 0) {
+      carolina_result_free(r);
       db_release(c);
       not_found(out);
       return;
@@ -1087,7 +1248,7 @@ static void handle_get(const char *path_in, const char *qs_in, Reply *out) {
     obj_end(&o);
     obj_end(&root);
     buf_free(&sps);
-    PQclear(r);
+    carolina_result_free(r);
     db_release(c);
     return;
   }
@@ -1106,6 +1267,40 @@ static const char *status_text(int code) {
   }
 }
 
+static int set_nonblock(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int send_all(int fd, const char *data, size_t n) {
+  size_t off = 0;
+  while (off < n) {
+    ssize_t w = send(fd, data + off, n - off, 0);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 5000) <= 0) return -1;
+        continue;
+      }
+      return -1;
+    }
+    if (w == 0) return -1;
+    off += (size_t)w;
+  }
+  return 0;
+}
+
+static long long mono_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
 static void write_http(int fd, int status, const char *body, size_t n) {
   char hdr[512];
   int hn = snprintf(hdr, sizeof(hdr),
@@ -1117,55 +1312,169 @@ static void write_http(int fd, int status, const char *body, size_t n) {
                     "Connection: close\r\n"
                     "\r\n",
                     status, status_text(status), kLanguage, kFramework, n);
-  if (hn > 0) (void)send(fd, hdr, (size_t)hn, 0);
-  if (n && body) (void)send(fd, body, n, 0);
+  if (hn > 0) {
+    size_t nsend = (size_t)hn < sizeof(hdr) ? (size_t)hn : sizeof(hdr) - 1;
+    send_all(fd, hdr, nsend);
+  }
+  if (n && body) send_all(fd, body, n);
 }
 
-static void handle_client(int fd) {
-  char buf[8192];
-  size_t n = 0;
-  struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  while (n < sizeof(buf) - 1) {
-    ssize_t r = recv(fd, buf + n, sizeof(buf) - 1 - n, 0);
-    if (r <= 0) break;
-    n += (size_t)r;
-    buf[n] = 0;
-    if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) break;
+static int method_ok(const char *method) {
+  return method && (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0);
+}
+
+static int dispatch(const char *method, const char *target, Reply *reply) {
+  if (!method_ok(method)) {
+    reply_init(reply, 405);
+    buf_puts(&reply->body, "{\"error\":\"method_not_allowed\"}");
+    return 405;
   }
-  buf[n] = 0;
+  char pathbuf[2048];
+  snprintf(pathbuf, sizeof(pathbuf), "%s", target ? target : "/");
+  char *qmark = strchr(pathbuf, '?');
+  const char *qs = "";
+  if (qmark) {
+    *qmark = 0;
+    qs = qmark + 1;
+  }
+  handle_get(pathbuf, qs, reply);
+  return reply->status;
+}
+
+static void complete_request(int fd, const char *req) {
   char method[16] = {0}, target[2048] = {0}, ver[16] = {0};
-  if (sscanf(buf, "%15s %2047s %15s", method, target, ver) != 3) {
+  if (sscanf(req, "%15s %2047s %15s", method, target, ver) != 3) {
     write_http(fd, 400, "{\"error\":\"bad_request\"}", 24);
     return;
   }
-  if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
-    write_http(fd, 405, "{\"error\":\"method_not_allowed\"}", 31);
-    return;
-  }
-  char *q = strchr(target, '?');
-  const char *qs = "";
-  if (q) {
-    *q = 0;
-    qs = q + 1;
-  }
   Reply reply;
-  handle_get(target, qs, &reply);
-  const char *body = reply.body.s ? reply.body.s : "";
-  size_t blen = reply.body.n;
-  if (strcmp(method, "HEAD") == 0) blen = 0;
-  write_http(fd, reply.status, body, blen);
+  dispatch(method, target, &reply);
+  size_t n = reply.body.n;
+  if (strcmp(method, "HEAD") == 0) n = 0;
+  write_http(fd, reply.status, reply.body.s ? reply.body.s : "", n);
   buf_free(&reply.body);
 }
 
-static void *worker(void *arg) {
-  int fd = *(int *)arg;
-  free(arg);
-  handle_client(fd);
-  close(fd);
-  return NULL;
+typedef struct {
+  int fd;
+  size_t n;
+  long long last_ms;
+  char buf[REQ_MAX];
+} Slot;
+
+static void slot_close(Slot *s) {
+  if (s->fd >= 0) close(s->fd);
+  s->fd = -1;
+  s->n = 0;
+  s->buf[0] = 0;
 }
 
+/* 1 = slot finished (responded or failed). 0 = need more bytes. */
+static int slot_consume(Slot *s) {
+  for (;;) {
+    if (strstr(s->buf, "\r\n\r\n") || strstr(s->buf, "\n\n")) {
+      complete_request(s->fd, s->buf);
+      return 1;
+    }
+    if (s->n >= sizeof(s->buf) - 1) {
+      write_http(s->fd, 400, "{\"error\":\"bad_request\"}", 24);
+      return 1;
+    }
+    ssize_t r = recv(s->fd, s->buf + s->n, sizeof(s->buf) - 1 - s->n, 0);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+      return 1;
+    }
+    if (r == 0) return 1;
+    s->n += (size_t)r;
+    s->buf[s->n] = 0;
+    s->last_ms = mono_ms();
+  }
+}
+
+void carolina_serve_stop(void) { g_serve_stop = 1; }
+
+void carolina_serve(int lfd) {
+  set_nonblock(lfd);
+  Slot *slots = calloc(MAX_INFLIGHT, sizeof(Slot));
+  if (!slots) abort();
+  for (int i = 0; i < MAX_INFLIGHT; i++) slots[i].fd = -1;
+
+  while (!g_serve_stop) {
+    struct pollfd pfds[MAX_INFLIGHT + 1];
+    int map[MAX_INFLIGHT + 1];
+    int np = 0;
+    pfds[np].fd = lfd;
+    pfds[np].events = POLLIN;
+    pfds[np].revents = 0;
+    map[np] = -1;
+    np++;
+    long long now = mono_ms();
+    for (int i = 0; i < MAX_INFLIGHT; i++) {
+      if (slots[i].fd < 0) continue;
+      if (slots[i].last_ms != 0 && now - slots[i].last_ms > CONN_IDLE_MS) {
+        slot_close(&slots[i]);
+        continue;
+      }
+      pfds[np].fd = slots[i].fd;
+      pfds[np].events = POLLIN;
+      pfds[np].revents = 0;
+      map[np] = i;
+      np++;
+    }
+    int pr = poll(pfds, (nfds_t)np, 200);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      perror("poll");
+      break;
+    }
+    if (pfds[0].revents & POLLIN) {
+      for (;;) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+          if (errno == EINTR) continue;
+          break;
+        }
+        int slot = -1;
+        for (int i = 0; i < MAX_INFLIGHT; i++) {
+          if (slots[i].fd < 0) {
+            slot = i;
+            break;
+          }
+        }
+        if (slot < 0) {
+          close(cfd);
+          continue;
+        }
+        set_nonblock(cfd);
+        slots[slot].fd = cfd;
+        slots[slot].n = 0;
+        slots[slot].buf[0] = 0;
+        slots[slot].last_ms = mono_ms();
+        if (slot_consume(&slots[slot])) slot_close(&slots[slot]);
+      }
+    }
+    for (int pi = 1; pi < np; pi++) {
+      short ev = pfds[pi].revents;
+      if (!ev) continue;
+      int si = map[pi];
+      if (si < 0 || slots[si].fd < 0) continue;
+      if (ev & (POLLERR | POLLNVAL)) {
+        slot_close(&slots[si]);
+        continue;
+      }
+      if (ev & (POLLIN | POLLHUP)) {
+        if (slot_consume(&slots[si])) slot_close(&slots[si]);
+      }
+    }
+  }
+
+  for (int i = 0; i < MAX_INFLIGHT; i++) slot_close(&slots[i]);
+  free(slots);
+}
+
+#ifndef CAROLINA_TEST
 static int http_post(const char *host, const char *port, const char *path, const char *token, const char *body) {
   struct addrinfo hints, *res = NULL;
   memset(&hints, 0, sizeof(hints));
@@ -1177,13 +1486,33 @@ static int http_post(const char *host, const char *port, const char *path, const
     freeaddrinfo(res);
     return -1;
   }
-  struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+  struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-  if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+  if (set_nonblock(fd) != 0) {
     close(fd);
     freeaddrinfo(res);
     return -1;
+  }
+  int crc = connect(fd, res->ai_addr, res->ai_addrlen);
+  if (crc != 0 && errno != EINPROGRESS) {
+    close(fd);
+    freeaddrinfo(res);
+    return -1;
+  }
+  if (crc != 0) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, 1000);
+    int err = 0;
+    socklen_t elen = sizeof(err);
+    if (pr <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0) {
+      close(fd);
+      freeaddrinfo(res);
+      return -1;
+    }
   }
   freeaddrinfo(res);
   char hdr[1024];
@@ -1264,6 +1593,7 @@ static void *register_thread(void *arg) {
   buf_free(&body);
   return NULL;
 }
+#endif
 
 int carolina_listen_family(void) { return AF_INET6; }
 
@@ -1311,10 +1641,13 @@ void carolina_set_connect_fn(PGconn *(*fn)(const char *)) {
     if (g_db_pool[i] && !g_connect_fn) PQfinish(g_db_pool[i]);
     g_db_pool[i] = NULL;
     g_db_busy[i] = 0;
+    g_db_bad[i] = 0;
   }
   g_connect_fn = fn;
   pthread_mutex_unlock(&g_db_mu);
 }
+
+void carolina_set_query_fn(carolina_query_fn fn) { g_query_fn = fn; }
 
 PGconn *carolina_db_acquire(void) { return db_acquire(); }
 
@@ -1325,6 +1658,18 @@ int carolina_handle_get_copy(const char *path, const char *qs, char *buf, size_t
   handle_get(path, qs, &reply);
   int status = reply.status;
   if (buf && buflen) snprintf(buf, buflen, "%s", reply.body.s ? reply.body.s : "");
+  buf_free(&reply.body);
+  return status;
+}
+
+int carolina_handle_http(const char *method, const char *target, char *buf, size_t buflen) {
+  Reply reply;
+  int status = dispatch(method, target, &reply);
+  if (buf && buflen) {
+    if (method && strcmp(method, "HEAD") == 0) buf[0] = 0;
+    else
+      snprintf(buf, buflen, "%s", reply.body.s ? reply.body.s : "");
+  }
   buf_free(&reply.body);
   return status;
 }
@@ -1347,28 +1692,8 @@ int main(void) {
   pthread_detach(rt);
 
   fprintf(stderr, "carolina-codes-c listening on :%d\n", port);
-  for (;;) {
-    struct sockaddr_in6 cli;
-    socklen_t clen = sizeof(cli);
-    int cfd = accept(fd, (struct sockaddr *)&cli, &clen);
-    if (cfd < 0) {
-      if (errno == EINTR) continue;
-      perror("accept");
-      continue;
-    }
-    int *arg = malloc(sizeof(int));
-    if (!arg) {
-      close(cfd);
-      continue;
-    }
-    *arg = cfd;
-    pthread_t t;
-    if (pthread_create(&t, NULL, worker, arg) != 0) {
-      close(cfd);
-      free(arg);
-      continue;
-    }
-    pthread_detach(t);
-  }
+  carolina_serve(fd);
+  close(fd);
+  return 0;
 }
 #endif

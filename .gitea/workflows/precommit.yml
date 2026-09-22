@@ -36,7 +36,7 @@ jobs:
       - run: |
           rm -f /etc/apt/apt.conf.d/docker-clean
           apt-get update -qq
-          apt-get install -y --no-install-recommends git ca-certificates curl tar gcc make pkg-config libpq-dev libc6-dev cppcheck clang-format python3
+          apt-get install -y --no-install-recommends git ca-certificates curl tar gcc make pkg-config libpq-dev libc6-dev cppcheck clang-format python3 libasan8 libubsan1
       - run: |
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi

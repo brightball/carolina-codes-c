@@ -1,5 +1,8 @@
 CC ?= gcc
-CFLAGS ?= -std=c11 -O2 -Wall -Wextra -pthread
+# Sanitizers stay off the Fly image. -Werror and ASan/UBSan are test-only.
+PROD_CFLAGS := -std=c11 -O2 -Wall -Wextra -pthread
+TEST_CFLAGS := -std=c11 -O1 -Wall -Wextra -Werror -pthread -fno-omit-frame-pointer -fsanitize=address,undefined
+TEST_LDFLAGS := -fsanitize=address,undefined
 CPPFLAGS += $(shell pkg-config --cflags libpq 2>/dev/null)
 LDLIBS += $(shell pkg-config --libs libpq 2>/dev/null)
 ifeq ($(strip $(LDLIBS)),)
@@ -22,14 +25,14 @@ CLANG_FORMAT ?= clang-format
 
 all: api
 
-api: src/main.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ src/main.c $(LDLIBS)
+api: src/main.c src/carolina.h
+	$(CC) $(PROD_CFLAGS) $(CPPFLAGS) -o $@ src/main.c $(LDLIBS) -s
 
 perf_test: src/main.c src/perf_test.c src/carolina.h
-	$(CC) $(CFLAGS) -Wno-unused-function -DCAROLINA_TEST $(CPPFLAGS) -Isrc -o $@ src/main.c src/perf_test.c $(LDLIBS)
+	$(CC) $(TEST_CFLAGS) -DCAROLINA_TEST $(CPPFLAGS) -Isrc -o $@ src/main.c src/perf_test.c $(LDLIBS) $(TEST_LDFLAGS)
 
 test: perf_test
-	./perf_test
+	ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1 ./perf_test
 
 fmt:
 	$(CLANG_FORMAT) -i $(SRC)
