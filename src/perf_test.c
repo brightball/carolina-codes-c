@@ -172,6 +172,8 @@ static void test_quality_gates(void) {
   expect(has_substr(body, "cppcheck") && has_substr(body, "clang-format"), "prepare installs cppcheck and clang-format");
   expect(has_substr(body, "gitleaks_8.30.1") && has_substr(body, "osv-scanner_linux_amd64"),
          "prepare installs gitleaks v8.30.1 and osv-scanner v2.6.0");
+  expect(has_substr(body, "--retry 5") && has_substr(body, "--connect-timeout 20"),
+         "prepare retries GitHub release downloads");
   expect(has_substr(body, "ci-pack.sh") && has_substr(body, "ci-artifact.sh upload"), "prepare publishes the packed toolchain");
   expect(!has_substr(body, "needs:"), "prepare does not wait on check jobs");
   expect(!has_substr(body, "make test") && !has_substr(body, "make sast") && !has_substr(body, "make vuln") &&
