@@ -255,6 +255,94 @@ static void test_quality_gates(void) {
   free(fly);
 }
 
+/* Version string for the named CycloneDX component, or NULL. */
+static const char *sbom_component_version(const char *sbom, const char *name, char *out, size_t outsz) {
+  if (!sbom || !name || !out || outsz == 0) return NULL;
+  char pat[128];
+  snprintf(pat, sizeof(pat), "\"name\": \"%s\"", name);
+  const char *at = strstr(sbom, pat);
+  if (!at) return NULL;
+  const char *ver = strstr(at, "\"version\": \"");
+  if (!ver) return NULL;
+  ver += strlen("\"version\": \"");
+  const char *end = strchr(ver, '"');
+  if (!end || end == ver) return NULL;
+  size_t n = (size_t)(end - ver);
+  if (n >= outsz) return NULL;
+  memcpy(out, ver, n);
+  out[n] = 0;
+  return out;
+}
+
+static void test_agent_docs(void) {
+  char *readme = slurp("README.md");
+  char *agents = slurp("AGENTS.md");
+  char *memory = slurp("MEMORY.md");
+  char *decisions = slurp("DECISIONS.md");
+  char *sbom = slurp("sbom.cdx.json");
+  expect(readme != NULL, "can read README.md");
+  expect(agents != NULL, "can read AGENTS.md");
+  expect(memory != NULL, "can read MEMORY.md");
+  expect(decisions != NULL, "can read DECISIONS.md");
+  expect(sbom != NULL, "can read sbom.cdx.json for the README libpq version");
+
+  expect(has_substr(readme, "C11"), "README names C11");
+  expect(has_substr(readme, "POSIX sockets"), "README names POSIX sockets");
+  expect(has_substr(readme, "libpq"), "README names libpq");
+  expect(has_substr(readme, "no framework semver"), "README states there is no framework semver");
+  expect(has_substr(readme, "__VERSION__"), "README says language_version is compiler __VERSION__");
+  expect(has_substr(readme, "bookworm"), "README names Debian bookworm gcc");
+  expect(has_substr(readme, "cppcheck"), "README names cppcheck");
+  expect(has_substr(readme, "clang-format"), "README names clang-format");
+  expect(has_substr(readme, "osv-scanner"), "README names osv-scanner");
+  expect(has_substr(readme, "gitleaks"), "README names gitleaks");
+  expect(!has_substr(readme, "CRaC"), "README does not add CRaC");
+
+  char libpq_ver[64];
+  const char *ver = sbom_component_version(sbom, "libpq5", libpq_ver, sizeof(libpq_ver));
+  expect(ver != NULL && ver[0] != 0, "SBOM records a libpq5 version");
+  expect(ver && has_substr(readme, ver), "README names the libpq5 version from the SBOM");
+
+  expect(has_substr(agents, "v1_*"), "AGENTS.md requires v1_* views only");
+  expect(has_substr(agents, "Never query Ash tables"), "AGENTS.md forbids Ash tables");
+  expect(has_substr(agents, "registration no-ops when the CMS is down"),
+         "AGENTS.md states registration no-ops when the CMS is down");
+  expect(has_substr(agents, "GET /health") && has_substr(agents, "does not touch the database"),
+         "AGENTS.md says GET /health does not touch the database");
+  expect(has_substr(agents, "MEMORY.md") && has_substr(agents, "DECISIONS.md"),
+         "AGENTS.md points at MEMORY.md and DECISIONS.md");
+  expect(has_substr(agents, "durable choice") && has_substr(agents, "operational fact"),
+         "AGENTS.md says when to update decisions and memory");
+
+  expect(has_substr(decisions, "POSIX sockets") && has_substr(decisions, "web framework"),
+         "DECISIONS.md records POSIX sockets instead of a C web framework");
+  expect(has_substr(decisions, "libpq") && has_substr(decisions, "v1_*"),
+         "DECISIONS.md records libpq against v1_* views");
+  expect(has_substr(decisions, "ASan") && has_substr(decisions, "UBSan") && has_substr(decisions, "test binary"),
+         "DECISIONS.md records ASan/UBSan only on the test binary");
+  expect(has_substr(decisions, "IPv6") && has_substr(decisions, "6PN"),
+         "DECISIONS.md records IPv6 listen for Fly 6PN");
+  expect(has_substr(decisions, "fail-open") && has_substr(decisions, "Register once"),
+         "DECISIONS.md records register-once fail-open");
+  expect(has_substr(decisions, "cppcheck") && has_substr(decisions, "osv-scanner") && has_substr(decisions, "gitleaks") &&
+             has_substr(decisions, "clang-format"),
+         "DECISIONS.md records the quality-gate tools");
+  expect(has_substr(decisions, "Contract lives in the CMS") && has_substr(decisions, "openapi.yaml"),
+         "DECISIONS.md records that the contract lives in the CMS");
+
+  expect(has_substr(memory, "CMS owns"), "MEMORY.md records that the CMS owns the views and the contract");
+  expect(has_substr(memory, "unsanitized") && has_substr(memory, "ASan"),
+         "MEMORY.md records production flags versus test sanitizers");
+  expect(has_substr(memory, "AF_INET6") && has_substr(memory, "6PN"), "MEMORY.md records the listen family");
+  expect(has_substr(memory, "Register once"), "MEMORY.md records register-once");
+
+  free(readme);
+  free(agents);
+  free(memory);
+  free(decisions);
+  free(sbom);
+}
+
 static const char *kSpkNames[] = {
     "slug", "first_name", "last_name", "name", "tagline", "bio", "company",
     "location", "photo_path", "twitter_url", "linkedin_url", "website_url", "github_url", "featured"};
@@ -795,6 +883,7 @@ int main(void) {
   }
 
   test_quality_gates();
+  test_agent_docs();
 
   if (g_failed) {
     fprintf(stderr, "perf_test failed\n");
